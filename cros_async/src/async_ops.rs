@@ -9,7 +9,7 @@ use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::add_waker;
+use crate::add_read_waker;
 
 pub trait ReadAsync {
     type Reader: Read + AsRawFd;
@@ -50,7 +50,7 @@ where
                 // TODO - should there be a non-blocking read before the first wakeup is scheduled
                 s.len_read = Some(0);
             }
-            add_waker(s.reader, cx.waker().clone());
+            add_read_waker(s.reader, cx.waker().clone());
         }
 
         Poll::Pending

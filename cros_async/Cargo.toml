@@ -8,5 +8,6 @@ edition = "2018"
 libc = "*"
 sys_util = { path = "../sys_util" }
 syscall_defines = { path = "../syscall_defines" }
+futures = "*"
 
 [workspace]

@@ -7,7 +7,7 @@ use std::io::{stdin, Read, StdinLock};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use cros_async::{FdExecutor,  add_waker};
+use cros_async::{FdExecutor,  add_read_waker};
 
 struct VectorProducer<'a> {
     stdin_lock: StdinLock<'a>,
@@ -36,7 +36,7 @@ impl<'a> Future for VectorProducer<'a> {
             }
         }
         self.started = true;
-        add_waker(&self.stdin_lock, cx.waker().clone());
+        add_read_waker(&self.stdin_lock, cx.waker().clone());
         Poll::Pending
     }
 }

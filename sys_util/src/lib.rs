@@ -79,8 +79,8 @@ use std::os::unix::net::UnixDatagram;
 use std::ptr;
 
 use libc::{
-    c_long, gid_t, kill, pid_t, pipe2, syscall, sysconf, uid_t, waitpid, O_CLOEXEC, SIGKILL,
-    WNOHANG, _SC_IOV_MAX, _SC_PAGESIZE,
+    c_long, gid_t, kill, pid_t, pipe2, syscall, sysconf, uid_t, waitpid, O_CLOEXEC, O_NONBLOCK,
+    SIGKILL, WNOHANG, _SC_IOV_MAX, _SC_PAGESIZE,
 };
 
 use syscall_defines::linux::LinuxSyscall::SYS_getpid;
@@ -268,8 +268,8 @@ pub fn kill_process_group() -> Result<()> {
 /// Spawns a pipe pair where the first pipe is the read end and the second pipe is the write end.
 ///
 /// If `close_on_exec` is true, the `O_CLOEXEC` flag will be set during pipe creation.
-pub fn pipe(close_on_exec: bool) -> Result<(File, File)> {
-    let flags = if close_on_exec { O_CLOEXEC } else { 0 };
+fn pipe_internal(close_on_exec: bool, blocking: bool) -> Result<(File, File)> {
+    let flags = if close_on_exec { O_CLOEXEC } else { 0 } | if !blocking { O_NONBLOCK } else { 0 };
     let mut pipe_fds = [-1; 2];
     // Safe because pipe2 will only write 2 element array of i32 to the given pointer, and we check
     // for error.
@@ -286,6 +286,21 @@ pub fn pipe(close_on_exec: bool) -> Result<(File, File)> {
             )
         })
     }
+}
+
+/// Spawns a pipe pair where the first pipe is the read end and the second pipe is the write end.
+///
+/// If `close_on_exec` is true, the `O_CLOEXEC` flag will be set during pipe creation.
+pub fn pipe(close_on_exec: bool) -> Result<(File, File)> {
+    pipe_internal(close_on_exec, true)
+}
+
+/// Spawns a pipe pair where the first pipe is the read end and the second pipe is the write end.
+/// Both pipes will have O_NON_BLOCK set in the open arguments.
+///
+/// If `close_on_exec` is true, the `O_CLOEXEC` flag will be set during pipe creation.
+pub fn pipe_non_blocking(close_on_exec: bool) -> Result<(File, File)> {
+    pipe_internal(close_on_exec, false)
 }
 
 /// Used to attempt to clean up a named pipe after it is no longer used.

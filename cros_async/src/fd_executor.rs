@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
-use sys_util::PollContext;
+use sys_util::{WatchingEvents,PollContext};
 
 thread_local!(static STATE: RefCell<InterfaceState> = RefCell::new(InterfaceState::new()));
 
 /// Runs futures to completion on a single thread. Futures are allowed to block on file descriptors
-/// only. Futures can only block on FDs becoming readable. `FdExecutor` is meant to be used where a
-/// poll or select loop would be used otherwise.
+/// only. Futures can only block on FDs becoming readable or writable. `FdExecutor` is meant to be
+/// used where a poll or select loop would be used otherwise.
 pub struct FdExecutor {
     futures: Vec<(Pin<Box<dyn Future<Output = ()>>>, AtomicBool)>,
 }
@@ -82,7 +82,7 @@ impl FdExecutor {
                     .iter()
                     .any(|(_fut, ready)| ready.load(Ordering::Relaxed))
                 {
-                    state.wait_wake_readable();
+                    state.wait_wake_event();
                 }
 
                 false
@@ -107,9 +107,9 @@ struct InterfaceState {
 /// The interface for a future to interact with the executor that runs it.
 /// Interfaces are provided to specify the FD to block on and for adding new futures to the
 /// executor.
-/// Used by futures who want to block until an FD becomes readable.
+/// Used by futures who want to block until an FD becomes readable or writable.
 /// Keeps a list of FDs and associated wakers that will be woekn with `wake_by_ref` when the FD
-/// becomes readable.
+/// becomes readable or writable.
 impl InterfaceState {
     /// Create an empty InterfaceState.
     pub fn new() -> InterfaceState {
@@ -122,9 +122,9 @@ impl InterfaceState {
     }
 
     /// Waits until one of the FDs is readable and wakes the associated waker.
-    pub fn wait_wake_readable(&mut self) {
+    pub fn wait_wake_event(&mut self) {
         let events = self.poll_ctx.wait().unwrap();
-        for e in events.iter_readable() {
+        for e in events.iter() {
             if let Some((fd, waker)) = self.token_map.remove(&e.token()) {
                 self.poll_ctx.delete(&fd).unwrap();
                 waker.wake_by_ref();
@@ -134,13 +134,29 @@ impl InterfaceState {
 }
 
 /// Tells the waking system to wake `waker` when `fd` becomes readable.
-pub fn add_waker(fd: &dyn AsRawFd, waker: Waker) {
+pub fn add_read_waker(fd: &dyn AsRawFd, waker: Waker) {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         while state.token_map.contains_key(&state.next_token) {
             state.next_token += 1;
         }
         state.poll_ctx.add(fd, state.next_token).unwrap();
+        let next_token = state.next_token;
+        state
+            .token_map
+            .insert(next_token, (SavedFd(fd.as_raw_fd()), waker));
+    });
+}
+
+/// Tells the waking system to wake `waker` when `fd` becomes writable.
+pub fn add_write_waker(fd: &dyn AsRawFd, waker: Waker) {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        while state.token_map.contains_key(&state.next_token) {
+            state.next_token += 1;
+        }
+        state.poll_ctx.add_fd_with_events(fd,
+                                          WatchingEvents::empty().set_write(),state.next_token).unwrap();
         let next_token = state.next_token;
         state
             .token_map
@@ -186,4 +202,105 @@ static WAKER_VTABLE: RawWakerVTable =
 
 unsafe fn create_waker(data_ptr: *const ()) -> RawWaker {
     RawWaker::new(data_ptr, &WAKER_VTABLE)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{add_read_waker, add_write_waker, FdExecutor};
+    use futures::io::{AsyncRead, AsyncWrite};
+    use futures::io::{AsyncReadExt, AsyncWriteExt};
+    use std::fs::File;
+    use std::io::{self, ErrorKind, Read, Write};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use sys_util::pipe_non_blocking;
+
+    struct AsyncRx(File);
+    struct AsyncTx(File);
+
+    fn async_pipes() -> (AsyncRx, AsyncTx) {
+        let (rx, tx) = pipe_non_blocking(true).unwrap();
+        (AsyncRx(rx), AsyncTx(tx))
+    }
+    impl AsyncRead for AsyncRx {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context,
+            buf: &mut [u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            match self.0.read(buf) {
+                Ok(len) => Poll::Ready(Ok(len)),
+                Err(e) => {
+                    if e.kind() == ErrorKind::WouldBlock {
+                        add_read_waker(&self.0, cx.waker().clone());
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Err(e))
+                    }
+                }
+            }
+        }
+    }
+    impl AsyncWrite for AsyncTx {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context,
+            buf: &[u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            match self.0.write(buf) {
+                Ok(len) => Poll::Ready(Ok(len)),
+                Err(e) => {
+                    if e.kind() == ErrorKind::WouldBlock {
+                        add_write_waker(&self.0, cx.waker().clone());
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Err(e))
+                    }
+                }
+            }
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), io::Error>> {
+            &self.0.flush().unwrap(); // TODO Could block.
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), io::Error>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    // A read and write closure are created and then added to the executor.
+    // They take turns blocking on the other sending a message.
+    #[test]
+    fn communicate_cross_closure() {
+        let (mut data_rx, mut data_tx) = async_pipes();
+        let (mut ack_rx, mut ack_tx) = async_pipes();
+
+        let read_closure = move || async move {
+            let mut buf = [0x55u8; 48];
+            data_rx.read_exact(&mut buf).await.expect("Failed to read");
+            assert!(buf.iter().all(|&e| e == 0x00));
+            ack_tx.write_all(&[b'a']).await.unwrap();
+            data_rx.read_exact(&mut buf).await.expect("Failed to read");
+            assert!(buf.iter().all(|&e| e == 0xaa));
+        };
+        let read_future = read_closure();
+
+        let write_closure = move || async move {
+            let zeros = [0u8; 48];
+            data_tx.write_all(&zeros).await.unwrap();
+            let mut ack = [0u8];
+            assert!(ack_rx.read_exact(&mut ack).await.is_ok());
+            let aas = [0xaau8; 48];
+            data_tx.write_all(&aas).await.unwrap();
+        };
+        let write_future = write_closure();
+
+        let mut ex = FdExecutor::new();
+        ex.add_future(Box::pin(read_future));
+        ex.add_future(Box::pin(write_future));
+
+        ex.run();
+    }
 }
