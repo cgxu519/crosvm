@@ -4,8 +4,13 @@
 
 use std::cmp::min;
 use std::num::Wrapping;
+use std::pin::Pin;
 use std::sync::atomic::{fence, Ordering};
+use std::task::{Context, Poll};
 
+use futures::Stream;
+
+use cros_async::AsyncEventFd;
 use sys_util::{error, GuestAddress, GuestMemory};
 
 use super::VIRTIO_MSI_NO_VECTOR;
@@ -192,6 +197,20 @@ impl<'a, 'b> Iterator for AvailIter<'a, 'b> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.queue.pop(self.mem)
+    }
+}
+
+/// Consuming async iterator over all available descriptor chain heads in the queue.
+pub struct AvailStream<'a, 'b> {
+    mem: &'a GuestMemory,
+    queue: &'b mut Queue,
+}
+
+impl<'a, 'b> Stream for AvailStream<'a, 'b> {
+    type Item = DescriptorChain<'a>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        Poll::Pending
     }
 }
 
