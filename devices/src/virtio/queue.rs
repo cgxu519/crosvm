@@ -9,6 +9,7 @@ use std::sync::atomic::{fence, Ordering};
 use std::task::{Context, Poll};
 
 use futures::Stream;
+use futures::StreamExt;
 
 use cros_async::AsyncEventFd;
 use sys_util::{error, GuestAddress, GuestMemory};
@@ -201,16 +202,32 @@ impl<'a, 'b> Iterator for AvailIter<'a, 'b> {
 }
 
 /// Consuming async iterator over all available descriptor chain heads in the queue.
-pub struct AvailStream<'a, 'b> {
+pub struct AvailStream<'a, 'b, 'c> {
     mem: &'a GuestMemory,
     queue: &'b mut Queue,
+    eventfd: &'c mut AsyncEventFd,
 }
 
-impl<'a, 'b> Stream for AvailStream<'a, 'b> {
+impl<'a, 'b, 'c> AvailStream<'a, 'b, 'c> {
+    fn pop(&mut self) -> Option<DescriptorChain<'a>> {
+        self.queue.pop(self.mem)
+    }
+}
+
+impl<'a, 'b, 'c> Stream for AvailStream<'a, 'b, 'c> {
     type Item = DescriptorChain<'a>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        Poll::Pending
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        loop {
+            // Check if there are more descriptors available.
+            if let Some(chain) = self.pop() {
+                return Poll::Ready(Some(chain));
+            }
+            // Check if the eventfd is ready and return pending if not.
+            if self.eventfd.poll_next_unpin(cx) == Poll::Pending {
+                return Poll::Pending;
+            }
+        }
     }
 }
 
