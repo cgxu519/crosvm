@@ -13,7 +13,7 @@ use std::task::{Context, Poll};
 use libc::{c_int, c_void, fcntl, read, EWOULDBLOCK, F_GETFL, F_SETFL, O_NONBLOCK};
 
 use sys_util::{self, Error, EventFd, Result};
-use msg_socket::{MsgSocket, MsgOnSocket};
+use msg_socket::{MsgError,MsgReceiver,MsgSocket, MsgOnSocket};
 
 use crate::add_read_waker;
 
@@ -100,16 +100,18 @@ impl<I: MsgOnSocket,O:MsgOnSocket+Default> Stream for AsyncMsgSocket<I,O> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
        match self.0.recv() {
-           Ok(msg) => Poll::Ready(msg)
-           Err(MsgError::Recv(SysError::new(EWOULDBLOCK)))) =>
-        
-            {
+           Ok(msg) => Poll::Ready(Some(msg)),
+           Err(MsgError::Recv(e)) => {
+                   if e.errno() == EWOULDBLOCK {
                 add_read_waker(&self.0, cx.waker().clone());
                 return Poll::Pending;
-            } 
-           Err(_) => 
+               }
                 // Indicate something went wrong and no more events will be provided.
-                return Poll::Ready(None)
+                Poll::Ready(None)
+            } 
+           Err(_) =>  {
+                // Indicate something went wrong and no more events will be provided.
+                Poll::Ready(None)
             }
         }
     }
