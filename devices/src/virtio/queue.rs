@@ -212,6 +212,10 @@ impl<'a, 'b, 'c> AvailStream<'a, 'b, 'c> {
     fn pop(&mut self) -> Option<DescriptorChain<'a>> {
         self.queue.pop(self.mem)
     }
+
+    pub fn queue_mut(&mut self) -> &mut Queue {
+        self.queue
+    }
 }
 
 impl<'a, 'b, 'c> Stream for AvailStream<'a, 'b, 'c> {
@@ -374,6 +378,18 @@ impl Queue {
     /// A consuming iterator over all available descriptor chain heads offered by the driver.
     pub fn iter<'a, 'b>(&'b mut self, mem: &'a GuestMemory) -> AvailIter<'a, 'b> {
         AvailIter { mem, queue: self }
+    }
+
+    pub fn stream<'a, 'b, 'c>(
+        &'b mut self,
+        mem: &'a GuestMemory,
+        eventfd: &'c mut AsyncEventFd,
+    ) -> AvailStream<'a, 'b, 'c> {
+        AvailStream {
+            mem,
+            queue: self,
+            eventfd,
+        }
     }
 
     /// Puts an available descriptor head into the used ring for use by the guest.
