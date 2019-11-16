@@ -84,6 +84,7 @@ version = "0.1.0"
 dependencies = [
  "futures 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc 0.2.44 (registry+https://github.com/rust-lang/crates.io-index)",
+ "msg_socket 0.1.0",
  "sys_util 0.1.0",
  "syscall_defines 0.1.0",
 ]

@@ -6,6 +6,7 @@ edition = "2018"
 
 [dependencies]
 libc = "*"
+msg_socket = { path = "../msg_socket" }
 sys_util = { path = "../sys_util" }
 syscall_defines = { path = "../syscall_defines" }
 futures = "*"

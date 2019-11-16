@@ -13,6 +13,7 @@ use std::task::{Context, Poll};
 use libc::{c_int, c_void, fcntl, read, EWOULDBLOCK, F_GETFL, F_SETFL, O_NONBLOCK};
 
 use sys_util::{self, Error, EventFd, Result};
+use msg_socket::{MsgSocket, MsgOnSocket};
 
 use crate::add_read_waker;
 
@@ -79,6 +80,39 @@ fn set_flags(fd: RawFd, flags: c_int) -> Result<()> {
         return Err(Error::last());
     }
     Ok(())
+}
+
+pub struct AsyncMsgSocket<I:MsgOnSocket,O:MsgOnSocket>(MsgSocket<I,O>);
+
+impl<I:MsgOnSocket,O:MsgOnSocket> TryFrom<MsgSocket<I,O>> for AsyncMsgSocket<I,O> {
+    type Error = sys_util::Error;
+
+    fn try_from(sock: MsgSocket<I,O>) -> Result<AsyncMsgSocket<I,O>> {
+        let fd = sock.as_raw_fd();
+        let flags = get_flags(fd)?;
+        set_flags(fd, flags | O_NONBLOCK)?;
+        Ok(AsyncMsgSocket(sock))
+    }
+}
+
+impl<I: MsgOnSocket,O:MsgOnSocket+Default> Stream for AsyncMsgSocket<I,O> {
+    type Item = O;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+       match self.0.recv() {
+           Ok(msg) => Poll::Ready(msg)
+           Err(MsgError::Recv(SysError::new(EWOULDBLOCK)))) =>
+        
+            {
+                add_read_waker(&self.0, cx.waker().clone());
+                return Poll::Pending;
+            } 
+           Err(_) => 
+                // Indicate something went wrong and no more events will be provided.
+                return Poll::Ready(None)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
