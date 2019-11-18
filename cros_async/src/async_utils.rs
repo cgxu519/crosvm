@@ -12,8 +12,8 @@ use std::task::{Context, Poll};
 
 use libc::{c_int, c_void, fcntl, read, EWOULDBLOCK, F_GETFL, F_SETFL, O_NONBLOCK};
 
+use msg_socket::{MsgError, MsgOnSocket, MsgReceiver, MsgSocket};
 use sys_util::{self, Error, EventFd, Result};
-use msg_socket::{MsgError,MsgReceiver,MsgSocket,MsgOnSocket};
 
 use crate::add_read_waker;
 
@@ -83,12 +83,12 @@ fn set_flags(fd: RawFd, flags: c_int) -> Result<()> {
 }
 
 // TODO(dgreid)Maybe Receiver instead???
-pub struct AsyncReceiver<I:MsgOnSocket, O:MsgOnSocket>(MsgSocket<I,O>);
+pub struct AsyncReceiver<I: MsgOnSocket, O: MsgOnSocket>(MsgSocket<I, O>);
 
-impl<I:MsgOnSocket, O:MsgOnSocket> TryFrom<MsgSocket<I,O>> for AsyncReceiver<I,O> {
+impl<I: MsgOnSocket, O: MsgOnSocket> TryFrom<MsgSocket<I, O>> for AsyncReceiver<I, O> {
     type Error = sys_util::Error;
 
-    fn try_from(sock: MsgSocket<I,O>) -> Result<AsyncReceiver<I,O>> {
+    fn try_from(sock: MsgSocket<I, O>) -> Result<AsyncReceiver<I, O>> {
         let fd = sock.as_raw_fd();
         let flags = get_flags(fd)?;
         set_flags(fd, flags | O_NONBLOCK)?;
@@ -96,22 +96,22 @@ impl<I:MsgOnSocket, O:MsgOnSocket> TryFrom<MsgSocket<I,O>> for AsyncReceiver<I,O
     }
 }
 
-impl<I:MsgOnSocket, O:MsgOnSocket> Stream for AsyncReceiver<I,O> {
+impl<I: MsgOnSocket, O: MsgOnSocket> Stream for AsyncReceiver<I, O> {
     type Item = O;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-       match self.0.recv() {
-           Ok(msg) => Poll::Ready(Some(msg)),
-           Err(MsgError::Recv(e)) => {
-                   if e.errno() == EWOULDBLOCK {
-                add_read_waker(&self.0, cx.waker().clone());
-                Poll::Pending
-               } else {
-                // Indicate something went wrong and no more events will be provided.
-                Poll::Ready(None)
-               }
-            } 
-           Err(_) =>  {
+        match self.0.recv() {
+            Ok(msg) => Poll::Ready(Some(msg)),
+            Err(MsgError::Recv(e)) => {
+                if e.errno() == EWOULDBLOCK {
+                    add_read_waker(&self.0, cx.waker().clone());
+                    Poll::Pending
+                } else {
+                    // Indicate something went wrong and no more events will be provided.
+                    Poll::Ready(None)
+                }
+            }
+            Err(_) => {
                 // Indicate something went wrong and no more events will be provided.
                 Poll::Ready(None)
             }
@@ -129,9 +129,11 @@ mod tests {
     fn eventfd_write_read() {
         let mut evt = AsyncEventFd::new().unwrap();
         evt.0.write(55).unwrap();
-        let read_closure = move || async move {
-            if let Some(e) = evt.next().await {
-                assert_eq!(e, 55);
+        let read_closure = move || {
+            async move {
+                if let Some(e) = evt.next().await {
+                    assert_eq!(e, 55);
+                }
             }
         };
         let read_future = read_closure();

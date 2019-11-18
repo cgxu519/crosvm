@@ -83,23 +83,33 @@ mod tests {
         let (mut data_rx, mut data_tx) = pipe(true).unwrap();
         let (mut ack_rx, mut ack_tx) = pipe(true).unwrap();
 
-        let read_closure = move || async move {
-            let mut buf = [0x55u8; 48];
-            data_rx.read_all_async(&mut buf).await.expect("Failed to read");
-            assert!(buf.iter().all(|&e| e == 0x00));
-            ack_tx.write(&[b'a']).unwrap();
-            data_rx.read_all_async(&mut buf).await.expect("Failed to read");
-            assert!(buf.iter().all(|&e| e == 0xaa));
+        let read_closure = move || {
+            async move {
+                let mut buf = [0x55u8; 48];
+                data_rx
+                    .read_all_async(&mut buf)
+                    .await
+                    .expect("Failed to read");
+                assert!(buf.iter().all(|&e| e == 0x00));
+                ack_tx.write(&[b'a']).unwrap();
+                data_rx
+                    .read_all_async(&mut buf)
+                    .await
+                    .expect("Failed to read");
+                assert!(buf.iter().all(|&e| e == 0xaa));
+            }
         };
         let read_future = read_closure();
 
-        let write_closure = move || async move {
-            let zeros = [0u8; 48];
-            data_tx.write(&zeros).unwrap();
-            let mut ack = [0u8];
-            assert_eq!(ack_rx.read_all_async(&mut ack).await.unwrap(), 1usize);
-            let aas = [0xaau8; 48];
-            data_tx.write(&aas).unwrap();
+        let write_closure = move || {
+            async move {
+                let zeros = [0u8; 48];
+                data_tx.write(&zeros).unwrap();
+                let mut ack = [0u8];
+                assert_eq!(ack_rx.read_all_async(&mut ack).await.unwrap(), 1usize);
+                let aas = [0xaau8; 48];
+                data_tx.write(&aas).unwrap();
+            }
         };
         let write_future = write_closure();
 

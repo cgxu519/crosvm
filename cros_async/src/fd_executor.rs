@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
-use sys_util::{WatchingEvents,PollContext};
+use sys_util::{PollContext, WatchingEvents};
 
 thread_local!(static STATE: RefCell<InterfaceState> = RefCell::new(InterfaceState::new()));
 
@@ -171,8 +171,10 @@ pub fn add_write_waker(fd: &dyn AsRawFd, waker: Waker) {
         while state.token_map.contains_key(&state.next_token) {
             state.next_token += 1;
         }
-        state.poll_ctx.add_fd_with_events(fd,
-                                          WatchingEvents::empty().set_write(),state.next_token).unwrap();
+        state
+            .poll_ctx
+            .add_fd_with_events(fd, WatchingEvents::empty().set_write(), state.next_token)
+            .unwrap();
         let next_token = state.next_token;
         state
             .token_map
@@ -290,32 +292,30 @@ mod tests {
     // They take turns blocking on the other sending a message.
     #[test]
     fn communicate_cross_closure() {
-        let (mut data_rx, mut data_tx) = async_pipes();
-        let (mut ack_rx, mut ack_tx) = async_pipes();
+        let (data_rx, data_tx) = async_pipes();
+        let (ack_rx, ack_tx) = async_pipes();
 
-        let read_closure = move || async move {
+        async fn handle_read(mut data_rx: AsyncRx, mut ack_tx: AsyncTx) {
             let mut buf = [0x55u8; 48];
             data_rx.read_exact(&mut buf).await.expect("Failed to read");
             assert!(buf.iter().all(|&e| e == 0x00));
             ack_tx.write_all(&[b'a']).await.unwrap();
             data_rx.read_exact(&mut buf).await.expect("Failed to read");
             assert!(buf.iter().all(|&e| e == 0xaa));
-        };
-        let read_future = read_closure();
+        }
 
-        let write_closure = move || async move {
+        async fn handle_write(mut data_tx: AsyncTx, mut ack_rx: AsyncRx) {
             let zeros = [0u8; 48];
             data_tx.write_all(&zeros).await.unwrap();
             let mut ack = [0u8];
             assert!(ack_rx.read_exact(&mut ack).await.is_ok());
             let aas = [0xaau8; 48];
             data_tx.write_all(&aas).await.unwrap();
-        };
-        let write_future = write_closure();
+        }
 
         let mut ex = FdExecutor::new();
-        ex.add_future(Box::pin(read_future));
-        ex.add_future(Box::pin(write_future));
+        ex.add_future(Box::pin(handle_read(data_rx, ack_tx)));
+        ex.add_future(Box::pin(handle_write(data_tx, ack_rx)));
 
         ex.run();
     }

@@ -7,7 +7,7 @@ use std::io::{stdin, Read, StdinLock};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use cros_async::{FdExecutor,  add_read_waker};
+use cros_async::{add_read_waker, FdExecutor};
 
 struct VectorProducer<'a> {
     stdin_lock: StdinLock<'a>,
@@ -15,7 +15,7 @@ struct VectorProducer<'a> {
 }
 
 impl<'a> VectorProducer<'a> {
-    pub fn new(stdin_lock: StdinLock<'a> ) -> Self {
+    pub fn new(stdin_lock: StdinLock<'a>) -> Self {
         VectorProducer {
             stdin_lock,
             started: false,
@@ -44,14 +44,16 @@ impl<'a> Future for VectorProducer<'a> {
 fn main() {
     let mut ex = FdExecutor::new();
 
-    let closure = move || async move {
-        let stdin = stdin();
-        let stdin_lock = stdin.lock();
+    let closure = move || {
+        async move {
+            let stdin = stdin();
+            let stdin_lock = stdin.lock();
 
-        let vec_future = VectorProducer::new(stdin_lock);
-        println!("Hello from async closure.");
-        let buf = vec_future.await;
-        println!("Hello from async closure again {}.", buf.len());
+            let vec_future = VectorProducer::new(stdin_lock);
+            println!("Hello from async closure.");
+            let buf = vec_future.await;
+            println!("Hello from async closure again {}.", buf.len());
+        }
     };
     println!("Hello from main");
     let future = closure();
