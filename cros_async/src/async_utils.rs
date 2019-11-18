@@ -13,7 +13,7 @@ use std::task::{Context, Poll};
 use libc::{c_int, c_void, fcntl, read, EWOULDBLOCK, F_GETFL, F_SETFL, O_NONBLOCK};
 
 use sys_util::{self, Error, EventFd, Result};
-use msg_socket::{MsgError,MsgReceiver,MsgSocket, MsgOnSocket};
+use msg_socket::{MsgError,MsgReceiver,MsgSocket,MsgOnSocket};
 
 use crate::add_read_waker;
 
@@ -82,20 +82,21 @@ fn set_flags(fd: RawFd, flags: c_int) -> Result<()> {
     Ok(())
 }
 
-pub struct AsyncMsgSocket<I:MsgOnSocket,O:MsgOnSocket>(MsgSocket<I,O>);
+// TODO(dgreid)Maybe Receiver instead???
+pub struct AsyncReceiver<I:MsgOnSocket, O:MsgOnSocket>(MsgSocket<I,O>);
 
-impl<I:MsgOnSocket,O:MsgOnSocket> TryFrom<MsgSocket<I,O>> for AsyncMsgSocket<I,O> {
+impl<I:MsgOnSocket, O:MsgOnSocket> TryFrom<MsgSocket<I,O>> for AsyncReceiver<I,O> {
     type Error = sys_util::Error;
 
-    fn try_from(sock: MsgSocket<I,O>) -> Result<AsyncMsgSocket<I,O>> {
+    fn try_from(sock: MsgSocket<I,O>) -> Result<AsyncReceiver<I,O>> {
         let fd = sock.as_raw_fd();
         let flags = get_flags(fd)?;
         set_flags(fd, flags | O_NONBLOCK)?;
-        Ok(AsyncMsgSocket(sock))
+        Ok(AsyncReceiver(sock))
     }
 }
 
-impl<I: MsgOnSocket,O:MsgOnSocket+Default> Stream for AsyncMsgSocket<I,O> {
+impl<I:MsgOnSocket, O:MsgOnSocket> Stream for AsyncReceiver<I,O> {
     type Item = O;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
@@ -104,10 +105,11 @@ impl<I: MsgOnSocket,O:MsgOnSocket+Default> Stream for AsyncMsgSocket<I,O> {
            Err(MsgError::Recv(e)) => {
                    if e.errno() == EWOULDBLOCK {
                 add_read_waker(&self.0, cx.waker().clone());
-                return Poll::Pending;
-               }
+                Poll::Pending
+               } else {
                 // Indicate something went wrong and no more events will be provided.
                 Poll::Ready(None)
+               }
             } 
            Err(_) =>  {
                 // Indicate something went wrong and no more events will be provided.
