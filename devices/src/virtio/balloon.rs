@@ -284,8 +284,7 @@ impl VirtioDevice for Balloon {
         &mut self,
         mem: GuestMemory,
         interrupt: Interrupt,
-        interrupt: Interrupt,
-        mut queues: Vec<Queue>,
+        queues: Vec<Queue>,
         queue_evts: Vec<EventFd>,
     ) {
         if queues.len() != QUEUE_SIZES.len() || queue_evts.len() != QUEUE_SIZES.len() {
