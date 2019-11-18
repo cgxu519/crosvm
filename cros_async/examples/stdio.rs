@@ -44,22 +44,19 @@ impl<'a> Future for VectorProducer<'a> {
 fn main() {
     let mut ex = FdExecutor::new();
 
-    let closure = move || {
-        async move {
-            let stdin = stdin();
-            let stdin_lock = stdin.lock();
+    async fn get_vec() {
+        let stdin = stdin();
+        let stdin_lock = stdin.lock();
 
-            let vec_future = VectorProducer::new(stdin_lock);
-            println!("Hello from async closure.");
-            let buf = vec_future.await;
-            println!("Hello from async closure again {}.", buf.len());
-        }
-    };
-    println!("Hello from main");
-    let future = closure();
-    println!("Hello from main again");
+        let vec_future = VectorProducer::new(stdin_lock);
+        println!("Hello from async closure.");
+        let buf = vec_future.await;
+        println!("Hello from async closure again {}.", buf.len());
+    }
+    println!("pre add future");
 
-    ex.add_future(Box::pin(future));
+    ex.add_future(Box::pin(get_vec()));
+    println!("after adding, before runninc");
 
     ex.run();
 }

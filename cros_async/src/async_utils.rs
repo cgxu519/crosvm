@@ -127,18 +127,15 @@ mod tests {
 
     #[test]
     fn eventfd_write_read() {
-        let mut evt = AsyncEventFd::new().unwrap();
+        let evt = AsyncEventFd::new().unwrap();
         evt.0.write(55).unwrap();
-        let read_closure = move || {
-            async move {
-                if let Some(e) = evt.next().await {
-                    assert_eq!(e, 55);
-                }
+        async fn read_one(mut evt: AsyncEventFd) {
+            if let Some(e) = evt.next().await {
+                assert_eq!(e, 55);
             }
-        };
-        let read_future = read_closure();
+        }
         let mut ex = FdExecutor::new();
-        ex.add_future(Box::pin(read_future));
+        ex.add_future(Box::pin(read_one(evt)));
         ex.run();
     }
 }
