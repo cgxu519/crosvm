@@ -37,9 +37,22 @@ impl FdExecutor {
         self.futures.push((future, AtomicBool::new(true)));
     }
 
-    /// Run the executor, this will consume the executor and only return once all the futures
+    /// Run the executor, this will consume the executor and return once all of the futures
     /// added to it have completed.
-    pub fn run(mut self) {
+    pub fn run_any(self) {
+        self.run_all(true)
+    }
+
+    /// Run the executor, this will consume the executor and return once any of the futures
+    /// added to it have completed.
+    pub fn run(self) {
+        self.run_all(false)
+    }
+
+    /// Run the executor, this will consume the executor and return once any of the futures
+    /// added to it have completed. If 'exit_any' is true, 'run_all' returns after any future
+    /// completes. If 'exit_any' is false, only return after all futures have completed.
+    fn run_all(mut self, exit_any: bool) {
         STATE.with(|state| {
             self.futures.append(&mut state.borrow_mut().new_futures);
         });
@@ -63,6 +76,9 @@ impl FdExecutor {
                     Poll::Pending => (),
                     Poll::Ready(()) => {
                         self.futures.remove(i);
+                        if exit_any {
+                            return;
+                        }
                     }
                 }
             }
