@@ -14,11 +14,9 @@ use std::thread;
 
 use futures::StreamExt;
 
-use cros_async::{FdExecutor,AsyncReceiver,AsyncEventFd};
+use cros_async::{AsyncEventFd, AsyncReceiver, FdExecutor};
 use data_model::{DataInit, Le32};
-use sys_util::{
-    self, error, info, warn, EventFd, GuestAddress, GuestMemory, 
-};
+use sys_util::{self, error, info, warn, EventFd, GuestAddress, GuestMemory};
 use vm_control::{BalloonControlCommand, BalloonControlResponseSocket};
 
 use super::{
@@ -75,106 +73,129 @@ struct BalloonConfig {
     actual_pages: AtomicUsize,
 }
 
-    fn run_worker(
-        mut queue_evts: Vec<EventFd>,
-        mut queues: Vec<Queue>,
-        command_socket: BalloonControlResponseSocket,
-        interrupt: Interrupt,
-        kill_evt: EventFd,
-        mem: GuestMemory,
-        config: Arc<BalloonConfig>,
-    ) {
-        let mut inflate_queue_evt = AsyncEventFd::try_from(queue_evts.remove(0)).unwrap();
-        let mut deflate_queue_evt = AsyncEventFd::try_from(queue_evts.remove(0)).unwrap();
-        let mut inflate_queue = queues.remove(0);
-        let mut deflate_queue = queues.remove(0);
-        let mut inflate_mem = mem.clone();
-        let mut deflate_mem = mem.clone();
-
-        let mut ex = FdExecutor::new();
-
-        // So it can be shared between async closures.
-        let interrupt = Rc::new(RefCell::new(interrupt));
-
-        let inflate_interrupt_cell = interrupt.clone();
-        let inflate_closure = move || async move {
-            let mut desc_mem = inflate_mem.clone();
-            let mut desc_stream = inflate_queue.stream(&mut desc_mem, &mut inflate_queue_evt);
-            while let Some(avail_desc) = desc_stream.next().await {
-                let index = avail_desc.index;
-                if process_inflate(avail_desc, &mut inflate_mem) {
-                    desc_stream.queue_mut().add_used(&mut inflate_mem, index, 0);
-                    inflate_interrupt_cell
-                        .borrow_mut()
-                        .signal_used_queue(desc_stream.queue_mut().vector);
-                }
-            }
-        };
-        let inflate_future= inflate_closure();
-        ex.add_future(Box::pin(inflate_future));
-
-        let deflate_interrupt_cell = interrupt.clone();
-        let deflate_closure = move || async move {
-            let mut desc_mem = deflate_mem.clone();
-            let mut desc_stream = deflate_queue.stream(&mut desc_mem, &mut deflate_queue_evt);
-            while let Some(avail_desc) = desc_stream.next().await {
-                let index = avail_desc.index;
-                // Do nothing with deflate.
-                desc_stream.queue_mut().add_used(&mut deflate_mem, index, 0);
-                deflate_interrupt_cell
-                    .borrow_mut()
-                    .signal_used_queue(desc_stream.queue_mut().vector);
-            }
-        };
-        let deflate_future=deflate_closure();
-        ex.add_future(Box::pin(deflate_future));
-
-        let mut command_socket = AsyncReceiver::try_from(command_socket).unwrap();
-        let command_interrupt_cell = interrupt.clone();
-        let command_closure = move || async move {
-            while let Some(req) = command_socket.next().await {
-                match req {
-                    BalloonControlCommand::Adjust { num_bytes } => {
-                        let num_pages =
-                            (num_bytes >> VIRTIO_BALLOON_PFN_SHIFT) as usize;
-                        info!("ballon config changed to consume {} pages", num_pages);
-
-                        config.num_pages.store(num_pages, Ordering::Relaxed);
-                        command_interrupt_cell.borrow_mut().signal_config_changed();
-                    }
-                }
-            }
-        };
-        let command_future = command_closure();
-        ex.add_future(Box::pin(command_future));
-
-        let resample_interrupt_cell = interrupt.clone();
-        let resample_closure = move || async move {
-            let resample_evt = resample_interrupt_cell.borrow_mut().get_resample_evt().try_clone().unwrap();
-            let mut resample_evt = AsyncEventFd::try_from(resample_evt).unwrap();
-            loop {  
-                if let Some(_) = resample_evt.next().await {
-                    resample_interrupt_cell.borrow_mut().interrupt_resample();
-                }
-                else { break;}
-
-            }
-        };
-        let resample_future =resample_closure();
-        ex.add_future(Box::pin(resample_future));
-
-        let kill_closure = move || async move {
-            let mut kill_evt = AsyncEventFd::try_from(kill_evt).unwrap();
-            // Once this event is readable, exit. Exiting this future will cause the main loop to
-            // break and the device process to exit.
-            kill_evt.next().await;
-        };
-        let kill_future = kill_closure();
-        ex.add_future(Box::pin(kill_future));
-
-        // And return once any future exits.
-        ex.run_any();
+async fn handle_inflate(
+    mut mem: GuestMemory,
+    mut queue: Queue,
+    queue_evt: EventFd,
+    interrupt: Rc<RefCell<Interrupt>>,
+) {
+    let mut desc_mem = mem.clone();
+    let mut inflate_queue_evt = AsyncEventFd::try_from(queue_evt).unwrap();
+    let mut desc_stream = queue.stream(&mut desc_mem, &mut inflate_queue_evt);
+    while let Some(avail_desc) = desc_stream.next().await {
+        let index = avail_desc.index;
+        if process_inflate(avail_desc, &mut mem) {
+            desc_stream.queue_mut().add_used(&mut mem, index, 0);
+            interrupt
+                .borrow_mut()
+                .signal_used_queue(desc_stream.queue_mut().vector);
+        }
     }
+}
+
+async fn handle_deflate(
+    mut mem: GuestMemory,
+    mut queue: Queue,
+    queue_evt: EventFd,
+    interrupt: Rc<RefCell<Interrupt>>,
+) {
+    let mut desc_mem = mem.clone();
+    let mut deflate_queue_evt = AsyncEventFd::try_from(queue_evt).unwrap();
+    let mut desc_stream = queue.stream(&mut desc_mem, &mut deflate_queue_evt);
+    while let Some(avail_desc) = desc_stream.next().await {
+        let index = avail_desc.index;
+        // Do nothing with deflate
+        desc_stream.queue_mut().add_used(&mut mem, index, 0);
+        interrupt
+            .borrow_mut()
+            .signal_used_queue(desc_stream.queue_mut().vector);
+    }
+}
+
+async fn handle_command_socket(
+    command_socket: BalloonControlResponseSocket,
+    interrupt: Rc<RefCell<Interrupt>>,
+    config: Arc<BalloonConfig>,
+) {
+    let mut command_socket = AsyncReceiver::try_from(command_socket).unwrap();
+    while let Some(req) = command_socket.next().await {
+        match req {
+            BalloonControlCommand::Adjust { num_bytes } => {
+                let num_pages = (num_bytes >> VIRTIO_BALLOON_PFN_SHIFT) as usize;
+                info!("ballon config changed to consume {} pages", num_pages);
+
+                config.num_pages.store(num_pages, Ordering::Relaxed);
+                interrupt.borrow_mut().signal_config_changed();
+            }
+        }
+    }
+}
+
+async fn handle_irq_resample(resample_evt: EventFd, interrupt: Rc<RefCell<Interrupt>>) {
+    let mut resample_evt = AsyncEventFd::try_from(resample_evt).unwrap();
+    loop {
+        if let Some(_) = resample_evt.next().await {
+            interrupt.borrow_mut().interrupt_resample();
+        } else {
+            break;
+        }
+    }
+}
+
+async fn wait_kill(kill_evt: EventFd) {
+    let mut kill_evt = AsyncEventFd::try_from(kill_evt).unwrap();
+    // Once this event is readable, exit. Exiting this future will cause the main loop to
+    // break and the device process to exit.
+    kill_evt.next().await;
+}
+
+fn run_worker(
+    mut queue_evts: Vec<EventFd>,
+    mut queues: Vec<Queue>,
+    command_socket: BalloonControlResponseSocket,
+    interrupt: Interrupt,
+    kill_evt: EventFd,
+    mem: GuestMemory,
+    config: Arc<BalloonConfig>,
+) {
+    let mut ex = FdExecutor::new();
+
+    let resample_evt = interrupt.get_resample_evt().try_clone().unwrap();
+
+    // So it can be shared between async closures.
+    let interrupt = Rc::new(RefCell::new(interrupt));
+
+    // The first queue is used for inflate messages
+    ex.add_future(Box::pin(handle_inflate(
+        mem.clone(),
+        queues.remove(0),
+        queue_evts.remove(0),
+        interrupt.clone(),
+    )));
+    // The first queue is used for deflate messages
+    ex.add_future(Box::pin(handle_deflate(
+        mem.clone(),
+        queues.remove(0),
+        queue_evts.remove(0),
+        interrupt.clone(),
+    )));
+    // Future to handle command messages that resize the balloon.
+    ex.add_future(Box::pin(handle_command_socket(
+        command_socket,
+        interrupt.clone(),
+        config,
+    )));
+    // Process any requests to resample the irq value.
+    ex.add_future(Box::pin(handle_irq_resample(
+        resample_evt,
+        interrupt.clone(),
+    )));
+    // Exit if the kill event is triggered.
+    ex.add_future(Box::pin(wait_kill(kill_evt)));
+
+    // And return once any future exits.
+    ex.run_any();
+}
 
 /// Virtio device for memory balloon inflation/deflation.
 pub struct Balloon {
@@ -285,7 +306,15 @@ impl VirtioDevice for Balloon {
         let worker_result = thread::Builder::new()
             .name("virtio_balloon".to_string())
             .spawn(move || {
-                run_worker(queue_evts, queues, command_socket, interrupt, kill_evt,mem,config);
+                run_worker(
+                    queue_evts,
+                    queues,
+                    command_socket,
+                    interrupt,
+                    kill_evt,
+                    mem,
+                    config,
+                );
             });
 
         match worker_result {
