@@ -14,10 +14,10 @@ use std::thread;
 
 use futures::StreamExt;
 
-use cros_async::{AsyncReceiver,AsyncEventFd};
+use cros_async::{FdExecutor,AsyncReceiver,AsyncEventFd};
 use data_model::{DataInit, Le32};
 use sys_util::{
-    self, error, info, warn, EventFd, GuestAddress, GuestMemory, PollContext, PollToken,
+    self, error, info, warn, EventFd, GuestAddress, GuestMemory, 
 };
 use vm_control::{BalloonControlCommand, BalloonControlResponseSocket};
 
@@ -75,48 +75,28 @@ struct BalloonConfig {
     actual_pages: AtomicUsize,
 }
 
-struct Worker {
-    mem: GuestMemory,
-    config: Arc<BalloonConfig>,
-}
-
-impl Worker {
-    fn run(
-        &mut self,
+    fn run_worker(
         mut queue_evts: Vec<EventFd>,
         mut queues: Vec<Queue>,
         command_socket: BalloonControlResponseSocket,
         interrupt: Interrupt,
         kill_evt: EventFd,
+    mem: GuestMemory,
+    config: Arc<BalloonConfig>,
     ) {
-        #[derive(PartialEq, PollToken)]
-        enum Token {
-            InterruptResample,
-            Kill,
-        }
-
         let mut inflate_queue_evt = AsyncEventFd::try_from(queue_evts.remove(0)).unwrap();
         let mut deflate_queue_evt = AsyncEventFd::try_from(queue_evts.remove(0)).unwrap();
         let mut inflate_queue = queues.remove(0);
         let mut deflate_queue = queues.remove(0);
-        let mut inflate_mem = self.mem.clone();
-        let mut deflate_mem = self.mem.clone();
+        let mut inflate_mem = mem.clone();
+        let mut deflate_mem = mem.clone();
 
-        let poll_ctx: PollContext<Token> = match PollContext::build_with(&[
-            (interrupt.get_resample_evt(), Token::InterruptResample),
-            (&kill_evt, Token::Kill),
-        ]) {
-            Ok(pc) => pc,
-            Err(e) => {
-                error!("failed creating PollContext: {}", e);
-                return;
-            }
-        };
+        let mut ex = FdExecutor::new();
 
         // So it can be shared between async closures.
-        let mut interrupt = Rc::new(RefCell::new(interrupt));
+        let interrupt = Rc::new(RefCell::new(interrupt));
 
-        let mut inflate_interrupt_cell = interrupt.clone();
+        let inflate_interrupt_cell = interrupt.clone();
         let inflate_closure = move || async move {
             let mut desc_mem = inflate_mem.clone();
             let mut desc_stream = inflate_queue.stream(&mut desc_mem, &mut inflate_queue_evt);
@@ -130,8 +110,10 @@ impl Worker {
                 }
             }
         };
+        let inflate_future= inflate_closure();
+        ex.add_future(Box::pin(inflate_future));
 
-        let mut deflate_interrupt_cell = interrupt.clone();
+        let deflate_interrupt_cell = interrupt.clone();
         let deflate_closure = move || async move {
             let mut desc_mem = deflate_mem.clone();
             let mut desc_stream = deflate_queue.stream(&mut desc_mem, &mut deflate_queue_evt);
@@ -144,6 +126,8 @@ impl Worker {
                     .signal_used_queue(desc_stream.queue_mut().vector);
             }
         };
+        let deflate_future=deflate_closure();
+        ex.add_future(Box::pin(deflate_future));
 
         let mut command_socket = AsyncReceiver::try_from(command_socket).unwrap();
         let command_interrupt_cell = interrupt.clone();
@@ -155,40 +139,42 @@ impl Worker {
                             (num_bytes >> VIRTIO_BALLOON_PFN_SHIFT) as usize;
                         info!("ballon config changed to consume {} pages", num_pages);
 
-                        self.config.num_pages.store(num_pages, Ordering::Relaxed);
+                        config.num_pages.store(num_pages, Ordering::Relaxed);
                         command_interrupt_cell.borrow_mut().signal_config_changed();
                     }
                 }
             }
         };
+        let command_future = command_closure();
+        ex.add_future(Box::pin(command_future));
 
-        'poll: loop {
-            let events = match poll_ctx.wait() {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("failed polling for events: {}", e);
-                    break;
+        let resample_interrupt_cell = interrupt.clone();
+        let resample_closure = move || async move {
+            let resample_evt = resample_interrupt_cell.borrow_mut().get_resample_evt().try_clone().unwrap();
+            let mut resample_evt = AsyncEventFd::try_from(resample_evt).unwrap();
+            loop {  
+                if let Some(_) = resample_evt.next().await {
+                    resample_interrupt_cell.borrow_mut().interrupt_resample();
                 }
-            };
+                else { break;}
 
-            for event in events.iter_readable() {
-                match event.token() {
-                    Token::InterruptResample => {
-                        interrupt.borrow_mut().interrupt_resample();
-                    }
-                    Token::Kill => break 'poll,
-                }
             }
-            for event in events.iter_hungup() {
-                //if event.token() == Token::CommandSocket && !event.readable() {
-                    // If this call fails, the command socket was already removed from the
-                    // PollContext.
-                    //let _ = poll_ctx.delete(&self.command_socket);
-                //}
-            }
-        }
+        };
+        let resample_future =resample_closure();
+        ex.add_future(Box::pin(resample_future));
+
+        let kill_closure = move || async move {
+            let mut kill_evt = AsyncEventFd::try_from(kill_evt).unwrap();
+            // Once this event is readable, exit. Exiting this future will cause the main loop to
+            // break and the device process to exit.
+            kill_evt.next().await;
+        };
+        let kill_future = kill_closure();
+        ex.add_future(Box::pin(kill_future));
+
+        // And return once any future exits.
+        ex.run_any();
     }
-}
 
 /// Virtio device for memory balloon inflation/deflation.
 pub struct Balloon {
@@ -299,11 +285,7 @@ impl VirtioDevice for Balloon {
         let worker_result = thread::Builder::new()
             .name("virtio_balloon".to_string())
             .spawn(move || {
-                let mut worker = Worker {
-                    mem,
-                    config,
-                };
-                worker.run(queue_evts, queues, command_socket, interrupt, kill_evt);
+                run_worker(queue_evts, queues, command_socket, interrupt, kill_evt,mem,config);
             });
 
         match worker_result {
