@@ -14,9 +14,8 @@ use std::thread;
 
 use futures::StreamExt;
 
-use crate::pci::MsixConfig;
+use cros_async::{AsyncReceiver,AsyncEventFd};
 use data_model::{DataInit, Le32};
-use msg_socket::MsgReceiver;
 use sys_util::{
     self, error, info, warn, EventFd, GuestAddress, GuestMemory, PollContext, PollToken,
 };
@@ -79,7 +78,6 @@ struct BalloonConfig {
 struct Worker {
     mem: GuestMemory,
     config: Arc<BalloonConfig>,
-    command_socket: BalloonControlResponseSocket,
 }
 
 impl Worker {
@@ -87,12 +85,12 @@ impl Worker {
         &mut self,
         mut queue_evts: Vec<EventFd>,
         mut queues: Vec<Queue>,
+        command_socket: BalloonControlResponseSocket,
         interrupt: Interrupt,
         kill_evt: EventFd,
     ) {
         #[derive(PartialEq, PollToken)]
         enum Token {
-            CommandSocket,
             InterruptResample,
             Kill,
         }
@@ -105,7 +103,6 @@ impl Worker {
         let mut deflate_mem = self.mem.clone();
 
         let poll_ctx: PollContext<Token> = match PollContext::build_with(&[
-            (&self.command_socket, Token::CommandSocket),
             (interrupt.get_resample_evt(), Token::InterruptResample),
             (&kill_evt, Token::Kill),
         ]) {
@@ -148,6 +145,23 @@ impl Worker {
             }
         };
 
+        let mut command_socket = AsyncReceiver::try_from(command_socket).unwrap();
+        let command_interrupt_cell = interrupt.clone();
+        let command_closure = move || async move {
+            while let Some(req) = command_socket.next().await {
+                match req {
+                    BalloonControlCommand::Adjust { num_bytes } => {
+                        let num_pages =
+                            (num_bytes >> VIRTIO_BALLOON_PFN_SHIFT) as usize;
+                        info!("ballon config changed to consume {} pages", num_pages);
+
+                        self.config.num_pages.store(num_pages, Ordering::Relaxed);
+                        command_interrupt_cell.borrow_mut().signal_config_changed();
+                    }
+                }
+            }
+        };
+
         'poll: loop {
             let events = match poll_ctx.wait() {
                 Ok(v) => v,
@@ -159,20 +173,6 @@ impl Worker {
 
             for event in events.iter_readable() {
                 match event.token() {
-                    Token::CommandSocket => {
-                        if let Ok(req) = self.command_socket.recv() {
-                            match req {
-                                BalloonControlCommand::Adjust { num_bytes } => {
-                                    let num_pages =
-                                        (num_bytes >> VIRTIO_BALLOON_PFN_SHIFT) as usize;
-                                    info!("ballon config changed to consume {} pages", num_pages);
-
-                                    self.config.num_pages.store(num_pages, Ordering::Relaxed);
-                                    interrupt.borrow_mut().signal_config_changed();
-                                }
-                            };
-                        }
-                    }
                     Token::InterruptResample => {
                         interrupt.borrow_mut().interrupt_resample();
                     }
@@ -180,11 +180,11 @@ impl Worker {
                 }
             }
             for event in events.iter_hungup() {
-                if event.token() == Token::CommandSocket && !event.readable() {
+                //if event.token() == Token::CommandSocket && !event.readable() {
                     // If this call fails, the command socket was already removed from the
                     // PollContext.
-                    let _ = poll_ctx.delete(&self.command_socket);
-                }
+                    //let _ = poll_ctx.delete(&self.command_socket);
+                //}
             }
         }
     }
@@ -301,10 +301,9 @@ impl VirtioDevice for Balloon {
             .spawn(move || {
                 let mut worker = Worker {
                     mem,
-                    command_socket,
                     config,
                 };
-                worker.run(queue_evts, queues, interrupt, kill_evt);
+                worker.run(queue_evts, queues, command_socket, interrupt, kill_evt);
             });
 
         match worker_result {
