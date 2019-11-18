@@ -81,8 +81,8 @@ struct BalloonConfig {
         command_socket: BalloonControlResponseSocket,
         interrupt: Interrupt,
         kill_evt: EventFd,
-    mem: GuestMemory,
-    config: Arc<BalloonConfig>,
+        mem: GuestMemory,
+        config: Arc<BalloonConfig>,
     ) {
         let mut inflate_queue_evt = AsyncEventFd::try_from(queue_evts.remove(0)).unwrap();
         let mut deflate_queue_evt = AsyncEventFd::try_from(queue_evts.remove(0)).unwrap();
