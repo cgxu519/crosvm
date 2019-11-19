@@ -131,11 +131,13 @@ async fn handle_command_socket(
     }
 }
 
-async fn handle_irq_resample(resample_evt: EventFd, interrupt: Rc<RefCell<Interrupt>>) {
+async fn handle_irq_resample(interrupt: Rc<RefCell<Interrupt>>) {
+    let interrupt = interrupt.borrow_mut();
+    let resample_evt = interrupt.get_resample_evt().try_clone().unwrap();
     let mut resample_evt = AsyncEventFd::try_from(resample_evt).unwrap();
     loop {
         if let Some(_) = resample_evt.next().await {
-            interrupt.borrow_mut().interrupt_resample();
+            interrupt.interrupt_resample();
         } else {
             break;
         }
@@ -160,9 +162,7 @@ fn run_worker(
 ) {
     let mut ex = FdExecutor::new();
 
-    let resample_evt = interrupt.get_resample_evt().try_clone().unwrap();
-
-    // So it can be shared between async closures.
+    // Wrap the interupt in a `RefCell` so it can be shared between async functions.
     let interrupt = Rc::new(RefCell::new(interrupt));
 
     // The first queue is used for inflate messages
@@ -186,10 +186,7 @@ fn run_worker(
         config,
     )));
     // Process any requests to resample the irq value.
-    ex.add_future(Box::pin(handle_irq_resample(
-        resample_evt,
-        interrupt.clone(),
-    )));
+    ex.add_future(Box::pin(handle_irq_resample(interrupt.clone())));
     // Exit if the kill event is triggered.
     ex.add_future(Box::pin(wait_kill(kill_evt)));
 

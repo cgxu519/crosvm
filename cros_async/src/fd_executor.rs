@@ -2,6 +2,29 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+//! An Executor to be used to driver file descriptor based futures to completion.
+//!
+//! When building futures to be run in an `FdExecutor` framework, use the following helper functions
+//! to perform common tasks:
+//!
+//! `add_read_waker` - Used to associate a provided FD becoming readable with the future being
+//! woken.
+//! `add_write_waker` - Used to associate a provided FD becoming writable with the future being
+//! woken.
+//! `add_future` - Used to add a new future to the top-level list of futures running.
+//!
+//! When starting the framework:
+//!
+//! ```
+//! async fn my_async() {
+//!     futures::future::ready(1).await;
+//! }
+//!
+//! let mut ex = cros_async::FdExecutor::new();
+//! ex.add_future(Box::pin(my_async()));
+//! ex.run();
+//! ```
+
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -14,6 +37,49 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 use sys_util::{PollContext, WatchingEvents};
 
 thread_local!(static STATE: RefCell<InterfaceState> = RefCell::new(InterfaceState::new()));
+
+/// Tells the waking system to wake `waker` when `fd` becomes readable.
+pub fn add_read_waker(fd: &dyn AsRawFd, waker: Waker) {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        while state.token_map.contains_key(&state.next_token) {
+            state.next_token += 1;
+        }
+        state.poll_ctx.add(fd, state.next_token).unwrap();
+        let next_token = state.next_token;
+        state
+            .token_map
+            .insert(next_token, (SavedFd(fd.as_raw_fd()), waker));
+    });
+}
+
+/// Tells the waking system to wake `waker` when `fd` becomes writable.
+pub fn add_write_waker(fd: &dyn AsRawFd, waker: Waker) {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        while state.token_map.contains_key(&state.next_token) {
+            state.next_token += 1;
+        }
+        state
+            .poll_ctx
+            .add_fd_with_events(fd, WatchingEvents::empty().set_write(), state.next_token)
+            .unwrap();
+        let next_token = state.next_token;
+        state
+            .token_map
+            .insert(next_token, (SavedFd(fd.as_raw_fd()), waker));
+    });
+}
+
+/// Adds a new top level future to the Executor.
+/// These futures must return `()`. The futures added here are intended to driver side-effects
+/// only. Use `add_future` for top-level futures.
+pub fn add_future(future: Pin<Box<dyn Future<Output = ()>>>) {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.new_futures.push((future, AtomicBool::new(true)));
+    });
+}
 
 /// Runs futures to completion on a single thread. Futures are allowed to block on file descriptors
 /// only. Futures can only block on FDs becoming readable or writable. `FdExecutor` is meant to be
@@ -30,6 +96,13 @@ impl FdExecutor {
         }
     }
 
+    /// Runs the given future until it completes. The future must return () as the `Output`.
+    pub fn run_one(future: Pin<Box<dyn Future<Output = ()>>>) {
+        let mut ex = Self::new();
+        ex.add_future(future);
+        ex.run()
+    }
+
     /// Appends the given future to the list of futures to run.
     /// These futures must return `()`. The futures added here are intended to driver side-effects
     /// only. Use `add_future` for top-level futures.
@@ -37,24 +110,23 @@ impl FdExecutor {
         self.futures.push((future, AtomicBool::new(true)));
     }
 
-    /// Run the executor, this will consume the executor and return once all of the futures
-    /// added to it have completed.
-    pub fn run_any(self) {
+    /// Run the executor until any future completes, this return once any of the futures added to it
+    /// have completed.
+    pub fn run_first(&mut self) {
         self.run_all(true)
     }
 
-    /// Run the executor, this will consume the executor and return once any of the futures
-    /// added to it have completed.
-    pub fn run(self) {
+    /// Run the executor, this will return once all of the futures added to it have completed.
+    pub fn run(&mut self) {
         self.run_all(false)
     }
 
     /// Run the executor, this will consume the executor and return once any of the futures
     /// added to it have completed. If 'exit_any' is true, 'run_all' returns after any future
     /// completes. If 'exit_any' is false, only return after all futures have completed.
-    fn run_all(mut self, exit_any: bool) {
+    fn run_all(&mut self, exit_any: bool) {
         STATE.with(|state| {
-           self.futures.append(&mut state.borrow_mut().new_futures);
+            self.futures.append(&mut state.borrow_mut().new_futures);
         });
 
         loop {
@@ -153,49 +225,6 @@ impl InterfaceState {
             }
         }
     }
-}
-
-/// Tells the waking system to wake `waker` when `fd` becomes readable.
-pub fn add_read_waker(fd: &dyn AsRawFd, waker: Waker) {
-    STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        while state.token_map.contains_key(&state.next_token) {
-            state.next_token += 1;
-        }
-        state.poll_ctx.add(fd, state.next_token).unwrap();
-        let next_token = state.next_token;
-        state
-            .token_map
-            .insert(next_token, (SavedFd(fd.as_raw_fd()), waker));
-    });
-}
-
-/// Tells the waking system to wake `waker` when `fd` becomes writable.
-pub fn add_write_waker(fd: &dyn AsRawFd, waker: Waker) {
-    STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        while state.token_map.contains_key(&state.next_token) {
-            state.next_token += 1;
-        }
-        state
-            .poll_ctx
-            .add_fd_with_events(fd, WatchingEvents::empty().set_write(), state.next_token)
-            .unwrap();
-        let next_token = state.next_token;
-        state
-            .token_map
-            .insert(next_token, (SavedFd(fd.as_raw_fd()), waker));
-    });
-}
-
-/// Adds a new top level future to the Executor.
-/// These futures must return `()`. The futures added here are intended to driver side-effects
-/// only. Use `add_future` for top-level futures.
-pub fn add_future(future: Pin<Box<dyn Future<Output = ()>>>) {
-    STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        state.new_futures.push((future, AtomicBool::new(true)));
-    });
 }
 
 // Saved FD exists becaus RawFd doesn't impl AsRawFd.
