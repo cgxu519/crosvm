@@ -4,16 +4,7 @@
 
 //! An Executor to be used to driver file descriptor based futures to completion.
 //!
-//! When building futures to be run in an `FdExecutor` framework, use the following helper functions
-//! to perform common tasks:
-//!
-//! `add_read_waker` - Used to associate a provided FD becoming readable with the future being
-//! woken.
-//! `add_write_waker` - Used to associate a provided FD becoming writable with the future being
-//! woken.
-//! `add_future` - Used to add a new future to the top-level list of futures running.
-//!
-//! When starting the framework:
+//! # Example of starting the framework and running a future:
 //!
 //! ```
 //! async fn my_async() {
@@ -24,6 +15,16 @@
 //! ex.add_future(Box::pin(my_async()));
 //! ex.run();
 //! ```
+//!
+//! When building futures to be run in an `FdExecutor` framework, use the following helper functions
+//! to perform common tasks:
+//!
+//! `add_read_waker` - Used to associate a provided FD becoming readable with the future being
+//! woken.
+//! `add_write_waker` - Used to associate a provided FD becoming writable with the future being
+//! woken.
+//! `add_future` - Used to add a new future to the top-level list of futures running.
+//!
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
