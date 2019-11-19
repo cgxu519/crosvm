@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
@@ -54,7 +54,7 @@ impl FdExecutor {
     /// completes. If 'exit_any' is false, only return after all futures have completed.
     fn run_all(mut self, exit_any: bool) {
         STATE.with(|state| {
-            self.futures.append(&mut state.borrow_mut().new_futures);
+           self.futures.append(&mut state.borrow_mut().new_futures);
         });
 
         loop {
@@ -115,7 +115,7 @@ impl FdExecutor {
 /// from the poll funciton of a future.
 struct InterfaceState {
     poll_ctx: PollContext<u64>,
-    token_map: HashMap<u64, (SavedFd, Waker)>,
+    token_map: BTreeMap<u64, (SavedFd, Waker)>,
     next_token: u64,
     new_futures: Vec<(Pin<Box<dyn Future<Output = ()>>>, AtomicBool)>,
 }
@@ -129,9 +129,15 @@ struct InterfaceState {
 impl InterfaceState {
     /// Create an empty InterfaceState.
     pub fn new() -> InterfaceState {
+        let poll_ctx = match PollContext::new() {
+            Ok(pc) => pc,
+            Err(e) => {
+                panic!("poll context creation failed: {}", e);
+            }
+        };
         InterfaceState {
-            poll_ctx: PollContext::new().unwrap(),
-            token_map: HashMap::new(),
+            poll_ctx,
+            token_map: BTreeMap::new(),
             next_token: 0,
             new_futures: Vec::new(),
         }
@@ -206,7 +212,6 @@ impl AsRawFd for SavedFd {
 unsafe fn waker_drop(_: *const ()) {}
 unsafe fn waker_wake(_: *const ()) {}
 unsafe fn waker_wake_by_ref(data_ptr: *const ()) {
-    println!("wake by ref");
     let bool_atomic_ptr = data_ptr as *const AtomicBool;
     let bool_atomic_ref = bool_atomic_ptr.as_ref().unwrap();
     bool_atomic_ref.store(true, Ordering::Relaxed);
