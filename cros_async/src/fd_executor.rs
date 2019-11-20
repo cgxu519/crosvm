@@ -39,36 +39,27 @@ use sys_util::{PollContext, WatchingEvents};
 
 thread_local!(static STATE: RefCell<ExecutorState> = RefCell::new(ExecutorState::new()));
 
+// Temporary holding area for things added to the executor.
+#[derive(Default)]
+struct Additions {
+    new_fds: Vec<(SavedFd, Waker, WatchingEvents)>,
+    new_futures: Vec<(Pin<Box<dyn Future<Output = ()>>>, AtomicBool)>,
+}
+thread_local!(static ADDITIONS: RefCell<Additions> = RefCell::new(Additions::default()));
+
 /// Tells the waking system to wake `waker` when `fd` becomes readable.
 pub fn add_read_waker(fd: &dyn AsRawFd, waker: Waker) {
-    STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        while state.token_map.contains_key(&state.next_token) {
-            state.next_token += 1;
-        }
-        state.poll_ctx.add(fd, state.next_token).unwrap();
-        let next_token = state.next_token;
-        state
-            .token_map
-            .insert(next_token, (SavedFd(fd.as_raw_fd()), waker));
+    ADDITIONS.with(|additions| {
+        let mut additions = additions.borrow_mut();
+        additions.new_fds.push((SavedFd(fd.as_raw_fd()), waker, WatchingEvents::empty().set_read()));
     });
 }
 
 /// Tells the waking system to wake `waker` when `fd` becomes writable.
 pub fn add_write_waker(fd: &dyn AsRawFd, waker: Waker) {
-    STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        while state.token_map.contains_key(&state.next_token) {
-            state.next_token += 1;
-        }
-        state
-            .poll_ctx
-            .add_fd_with_events(fd, WatchingEvents::empty().set_write(), state.next_token)
-            .unwrap();
-        let next_token = state.next_token;
-        state
-            .token_map
-            .insert(next_token, (SavedFd(fd.as_raw_fd()), waker));
+    ADDITIONS.with(|additions| {
+        let mut additions = additions.borrow_mut();
+        additions.new_fds.push((SavedFd(fd.as_raw_fd()), waker, WatchingEvents::empty().set_write()));
     });
 }
 
@@ -76,9 +67,9 @@ pub fn add_write_waker(fd: &dyn AsRawFd, waker: Waker) {
 /// These futures must return `()`. The futures added here are intended to driver side-effects
 /// only. Use `add_future` for top-level futures.
 pub fn add_future(future: Pin<Box<dyn Future<Output = ()>>>) {
-    STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        state.new_futures.push((future, AtomicBool::new(true)));
+    ADDITIONS.with(|additions| {
+        let mut additions = additions.borrow_mut();
+        additions.new_futures.push((future, AtomicBool::new(true)));
     });
 }
 
@@ -87,6 +78,9 @@ pub fn add_future(future: Pin<Box<dyn Future<Output = ()>>>) {
 /// used where a poll or select loop would be used otherwise.
 pub struct FdExecutor {
     futures: Vec<(Pin<Box<dyn Future<Output = ()>>>, AtomicBool)>,
+    poll_ctx: PollContext<u64>,
+    token_map: BTreeMap<u64, (SavedFd, Waker)>,
+    next_token: u64, // Next token for adding to the poll context.
 }
 
 impl FdExecutor {
@@ -94,6 +88,9 @@ impl FdExecutor {
     pub fn new() -> FdExecutor {
         FdExecutor {
             futures: Vec::new(),
+            poll_ctx: PollContext::new().unwrap(),
+            token_map: BTreeMap::new(),
+            next_token: 0,
         }
     }
 
@@ -111,7 +108,7 @@ impl FdExecutor {
         ex.run()
     }
 
-    /// Run the executor until any future completes, this return once any of the futures added to it
+    /// Run the executor until any future completes, returns once any of the futures added to it
     /// have completed.
     pub fn run_first(&mut self) {
         self.run_all(true)
@@ -126,17 +123,13 @@ impl FdExecutor {
     /// added to it have completed. If 'exit_any' is true, 'run_all' returns after any future
     /// completes. If 'exit_any' is false, only return after all futures have completed.
     fn run_all(&mut self, exit_any: bool) {
-        // Add any futures that were added to the state before starting.
-        STATE.with(|state| {
-            self.futures.append(&mut state.borrow_mut().new_futures);
-        });
-
         loop {
             // for each future that is ready:
             //  poll it
             //  remove it if ready
             let mut i = 0;
-            while i < self.futures.len() { // The loop would be `drain_filter` if it was stable.
+            while i < self.futures.len() {
+                // The loop would be `drain_filter` if it was stable.
                 let (fut, ready) = &mut self.futures[i];
 
                 if ready.swap(false, Ordering::Relaxed) && poll_one(fut, ready) == Poll::Ready(()) {
@@ -149,29 +142,27 @@ impl FdExecutor {
                 }
             }
 
-            // Add any new futures to the list.
-            let all_done = STATE.with(|state| {
-                let mut state = state.borrow_mut();
-                self.futures.append(&mut state.new_futures);
+            // Add any new futures and wakers to the lists.
+            ADDITIONS.with(|additions| {
+                let mut additions = additions.borrow_mut();
+                self.futures.append(&mut additions.new_futures);
 
-                if self.futures.is_empty() {
-                    return true;
+                for (saved_fd, waker, events) in additions.new_fds.drain() {
+                    self.add_waker(saved_fd, waker, events);
                 }
-
-                // Make sure there aren't any futures ready before sleeping.
-                if !self
-                    .futures
-                    .iter()
-                    .any(|(_fut, ready)| ready.load(Ordering::Relaxed))
-                {
-                    state.wait_wake_event();
-                }
-
-                false
             });
 
-            if all_done {
+            if self.futures.is_empty() {
                 return;
+            }
+
+            // If no futures are read, sleep until a waker is signaled.
+            if !self
+                .futures
+                .iter()
+                .any(|(_fut, ready)| ready.load(Ordering::Relaxed))
+            {
+                self.wait_wake_event();
             }
         }
 
@@ -188,6 +179,29 @@ impl FdExecutor {
             let mut ctx = Context::from_waker(&waker);
             let f = future.as_mut();
             f.poll(&mut ctx)
+        }
+    }
+
+    // Adds an fd that, when signaled, will trigger the given waker.
+    fn add_waker(&mut self, fd: SavedFd, waker: Waker, events: WatchingEvents) {
+        while self.token_map.contains_key(&self.next_token) {
+            self.next_token += 1;
+        }
+        self.poll_ctx
+            .add_fd_with_events(&fd, events, self.next_token)
+            .unwrap();
+        let next_token = self.next_token;
+        self.token_map.insert(next_token, (fd, waker));
+    }
+
+    /// Waits until one of the FDs is readable and wakes the associated waker.
+    pub fn wait_wake_event(&mut self) {
+        let events = self.poll_ctx.wait().unwrap();
+        for e in events.iter() {
+            if let Some((fd, waker)) = self.token_map.remove(&e.token()) {
+                self.poll_ctx.delete(&fd).unwrap();
+                waker.wake_by_ref();
+            }
         }
     }
 }
@@ -221,17 +235,6 @@ impl ExecutorState {
             token_map: BTreeMap::new(),
             next_token: 0,
             new_futures: Vec::new(),
-        }
-    }
-
-    /// Waits until one of the FDs is readable and wakes the associated waker.
-    pub fn wait_wake_event(&mut self) {
-        let events = self.poll_ctx.wait().unwrap();
-        for e in events.iter() {
-            if let Some((fd, waker)) = self.token_map.remove(&e.token()) {
-                self.poll_ctx.delete(&fd).unwrap();
-                waker.wake_by_ref();
-            }
         }
     }
 }
