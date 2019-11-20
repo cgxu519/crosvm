@@ -125,9 +125,8 @@ impl FdExecutor {
         self.run_all(false)
     }
 
-    /// Run the executor, this will consume the executor and return once any of the futures
-    /// added to it have completed. If 'exit_any' is true, 'run_all' returns after any future
-    /// completes. If 'exit_any' is false, only return after all futures have completed.
+    // Run the executor, If 'exit_any' is true, 'run_all' returns after any future completes. If
+    // 'exit_any' is false, `run_all` only returns after all futures have completed.
     fn run_all(&mut self, exit_any: bool) {
         loop {
             // for each future that is ready:
@@ -175,6 +174,8 @@ impl FdExecutor {
             }
         }
 
+        // Polls one future and returns the result.
+        // Covers setting up the waker and context before calling the future.
         fn poll_one(
             future: &mut Pin<Box<dyn Future<Output = ()>>>,
             ready: &mut AtomicBool,
