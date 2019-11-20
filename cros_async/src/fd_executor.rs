@@ -132,28 +132,20 @@ impl FdExecutor {
         });
 
         loop {
-            // This loop could use the unstable drain_filter() from Vec.
-            for i in 0..self.futures.len() {
+            // for each future that is ready:
+            //  poll it
+            //  remove it if ready
+            let mut i = 0;
+            while i < self.futures.len() { // The loop would be `drain_filter` if it was stable.
                 let (fut, ready) = &mut self.futures[i];
 
-                if !ready.load(Ordering::Relaxed) {
-                    continue;
-                }
-
-                ready.store(false, Ordering::Relaxed);
-                let raw_waker = unsafe { create_waker(ready as *const _ as *const _) };
-
-                let waker = unsafe { Waker::from_raw(raw_waker) };
-                let mut ctx = Context::from_waker(&waker);
-                let f = fut.as_mut();
-                match f.poll(&mut ctx) {
-                    Poll::Pending => (),
-                    Poll::Ready(()) => {
-                        self.futures.remove(i);
-                        if exit_any {
-                            return;
-                        }
+                if ready.swap(false, Ordering::Relaxed) && poll_one(fut, ready) == Poll::Ready(()) {
+                    self.futures.remove(i);
+                    if exit_any {
+                        return;
                     }
+                } else {
+                    i += 1;
                 }
             }
 
@@ -181,6 +173,21 @@ impl FdExecutor {
             if all_done {
                 return;
             }
+        }
+
+        fn poll_one(
+            future: &mut Pin<Box<dyn Future<Output = ()>>>,
+            ready: &mut AtomicBool,
+        ) -> Poll<()> {
+            // Safe because a valid pointer is passed to `create_waker` and the valid result is
+            // passed to `Waker::from_raw`.
+            let waker = unsafe {
+                let raw_waker = create_waker(ready as *const _ as *const _);
+                Waker::from_raw(raw_waker)
+            };
+            let mut ctx = Context::from_waker(&waker);
+            let f = future.as_mut();
+            f.poll(&mut ctx)
         }
     }
 }
@@ -315,7 +322,7 @@ mod tests {
         }
 
         fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), io::Error>> {
-            &self.0.flush().unwrap(); // TODO Could block.
+            &self.0.flush().unwrap(); // This could block but it doesn't matter for the tests.
             Poll::Ready(Ok(()))
         }
 
