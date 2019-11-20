@@ -39,15 +39,15 @@ use sys_util::{PollContext, WatchingEvents};
 
 // Temporary holding areas for things added to the executor.
 // File descriptor wakers that are added during poll calls.
-thread_local!(static FDS: RefCell<Vec<(SavedFd, Waker, WatchingEvents)>> =
+thread_local!(static NEW_FDS: RefCell<Vec<(SavedFd, Waker, WatchingEvents)>> =
               RefCell::new(Vec::new()));
 // Top level futures that are added during poll calls.
-thread_local!(static FUTURES: RefCell<Vec<(Pin<Box<dyn Future<Output = ()>>>, AtomicBool)>> =
+thread_local!(static NEW_FUTURES: RefCell<Vec<(Pin<Box<dyn Future<Output = ()>>>, AtomicBool)>> =
               RefCell::new(Vec::new()));
 
 /// Tells the waking system to wake `waker` when `fd` becomes readable.
 pub fn add_read_waker(fd: &dyn AsRawFd, waker: Waker) {
-    FDS.with(|new_fds| {
+    NEW_FDS.with(|new_fds| {
         let mut new_fds = new_fds.borrow_mut();
         new_fds.push((
             SavedFd(fd.as_raw_fd()),
@@ -59,7 +59,7 @@ pub fn add_read_waker(fd: &dyn AsRawFd, waker: Waker) {
 
 /// Tells the waking system to wake `waker` when `fd` becomes writable.
 pub fn add_write_waker(fd: &dyn AsRawFd, waker: Waker) {
-    FDS.with(|new_fds| {
+    NEW_FDS.with(|new_fds| {
         let mut new_fds = new_fds.borrow_mut();
         new_fds.push((
             SavedFd(fd.as_raw_fd()),
@@ -73,7 +73,7 @@ pub fn add_write_waker(fd: &dyn AsRawFd, waker: Waker) {
 /// These futures must return `()`. The futures added here are intended to driver side-effects
 /// only. Use `add_future` for top-level futures.
 pub fn add_future(future: Pin<Box<dyn Future<Output = ()>>>) {
-    FUTURES.with(|new_futures| {
+    NEW_FUTURES.with(|new_futures| {
         let mut new_futures = new_futures.borrow_mut();
         new_futures.push((future, AtomicBool::new(true)));
     });
@@ -149,12 +149,12 @@ impl FdExecutor {
             }
 
             // Add any new futures and wakers to the lists.
-            FUTURES.with(|new_futures| {
+            NEW_FUTURES.with(|new_futures| {
                 let mut new_futures = new_futures.borrow_mut();
                 self.futures.append(&mut new_futures);
             });
 
-            FDS.with(|new_fds| {
+            NEW_FDS.with(|new_fds| {
                 let mut new_fds = new_fds.borrow_mut();
                 for (saved_fd, waker, events) in new_fds.drain(..) {
                     self.add_waker(saved_fd, waker, events);
