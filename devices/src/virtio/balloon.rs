@@ -191,7 +191,7 @@ fn run_worker(
     ex.add_future(Box::pin(wait_kill(kill_evt)));
 
     // And return once any future exits.
-    ex.run_any();
+    ex.run_first();
 }
 
 /// Virtio device for memory balloon inflation/deflation.
