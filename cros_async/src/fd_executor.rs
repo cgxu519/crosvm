@@ -37,8 +37,6 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 
 use sys_util::{PollContext, WatchingEvents};
 
-thread_local!(static STATE: RefCell<ExecutorState> = RefCell::new(ExecutorState::new()));
-
 // Temporary holding area for things added to the executor.
 #[derive(Default)]
 struct Additions {
@@ -147,7 +145,7 @@ impl FdExecutor {
                 let mut additions = additions.borrow_mut();
                 self.futures.append(&mut additions.new_futures);
 
-                for (saved_fd, waker, events) in additions.new_fds.drain() {
+                for (saved_fd, waker, events) in additions.new_fds.drain(..) {
                     self.add_waker(saved_fd, waker, events);
                 }
             });
@@ -202,39 +200,6 @@ impl FdExecutor {
                 self.poll_ctx.delete(&fd).unwrap();
                 waker.wake_by_ref();
             }
-        }
-    }
-}
-
-// Handles tracking the state of any futures blocked on FDs and allows adding a wake up request
-// from the poll funciton of a future.
-struct ExecutorState {
-    poll_ctx: PollContext<u64>,
-    token_map: BTreeMap<u64, (SavedFd, Waker)>,
-    next_token: u64,
-    new_futures: Vec<(Pin<Box<dyn Future<Output = ()>>>, AtomicBool)>,
-}
-
-// The interface for a future to interact with the executor that runs it.
-// Interfaces are provided to specify the FD to block on and for adding new futures to the
-// executor.
-// Used by futures who want to block until an FD becomes readable or writable.
-// Keeps a list of FDs and associated wakers that will be woekn with `wake_by_ref` when the FD
-// becomes readable or writable.
-impl ExecutorState {
-    // Create an empty ExecutorState.
-    pub fn new() -> ExecutorState {
-        let poll_ctx = match PollContext::new() {
-            Ok(pc) => pc,
-            Err(e) => {
-                panic!("poll context creation failed: {}", e);
-            }
-        };
-        ExecutorState {
-            poll_ctx,
-            token_map: BTreeMap::new(),
-            next_token: 0,
-            new_futures: Vec::new(),
         }
     }
 }
