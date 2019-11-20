@@ -37,7 +37,7 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 
 use sys_util::{PollContext, WatchingEvents};
 
-thread_local!(static STATE: RefCell<InterfaceState> = RefCell::new(InterfaceState::new()));
+thread_local!(static STATE: RefCell<ExecutorState> = RefCell::new(ExecutorState::new()));
 
 /// Tells the waking system to wake `waker` when `fd` becomes readable.
 pub fn add_read_waker(fd: &dyn AsRawFd, waker: Waker) {
@@ -97,18 +97,18 @@ impl FdExecutor {
         }
     }
 
+    /// Appends the given future to the list of futures to run.
+    /// These futures must return `()`. The futures added here are intended to drive side-effects
+    /// only. Use `add_future` for top-level futures.
+    pub fn add_future(&mut self, future: Pin<Box<dyn Future<Output = ()>>>) {
+        self.futures.push((future, AtomicBool::new(true)));
+    }
+
     /// Runs the given future until it completes. The future must return () as the `Output`.
     pub fn run_one(future: Pin<Box<dyn Future<Output = ()>>>) {
         let mut ex = Self::new();
         ex.add_future(future);
         ex.run()
-    }
-
-    /// Appends the given future to the list of futures to run.
-    /// These futures must return `()`. The futures added here are intended to driver side-effects
-    /// only. Use `add_future` for top-level futures.
-    pub fn add_future(&mut self, future: Pin<Box<dyn Future<Output = ()>>>) {
-        self.futures.push((future, AtomicBool::new(true)));
     }
 
     /// Run the executor until any future completes, this return once any of the futures added to it
@@ -126,6 +126,7 @@ impl FdExecutor {
     /// added to it have completed. If 'exit_any' is true, 'run_all' returns after any future
     /// completes. If 'exit_any' is false, only return after all futures have completed.
     fn run_all(&mut self, exit_any: bool) {
+        // Add any futures that were added to the state before starting.
         STATE.with(|state| {
             self.futures.append(&mut state.borrow_mut().new_futures);
         });
@@ -184,31 +185,31 @@ impl FdExecutor {
     }
 }
 
-/// Handles tracking the state of any futures blocked on FDs and allows adding a wake up request
-/// from the poll funciton of a future.
-struct InterfaceState {
+// Handles tracking the state of any futures blocked on FDs and allows adding a wake up request
+// from the poll funciton of a future.
+struct ExecutorState {
     poll_ctx: PollContext<u64>,
     token_map: BTreeMap<u64, (SavedFd, Waker)>,
     next_token: u64,
     new_futures: Vec<(Pin<Box<dyn Future<Output = ()>>>, AtomicBool)>,
 }
 
-/// The interface for a future to interact with the executor that runs it.
-/// Interfaces are provided to specify the FD to block on and for adding new futures to the
-/// executor.
-/// Used by futures who want to block until an FD becomes readable or writable.
-/// Keeps a list of FDs and associated wakers that will be woekn with `wake_by_ref` when the FD
-/// becomes readable or writable.
-impl InterfaceState {
-    /// Create an empty InterfaceState.
-    pub fn new() -> InterfaceState {
+// The interface for a future to interact with the executor that runs it.
+// Interfaces are provided to specify the FD to block on and for adding new futures to the
+// executor.
+// Used by futures who want to block until an FD becomes readable or writable.
+// Keeps a list of FDs and associated wakers that will be woekn with `wake_by_ref` when the FD
+// becomes readable or writable.
+impl ExecutorState {
+    // Create an empty ExecutorState.
+    pub fn new() -> ExecutorState {
         let poll_ctx = match PollContext::new() {
             Ok(pc) => pc,
             Err(e) => {
                 panic!("poll context creation failed: {}", e);
             }
         };
-        InterfaceState {
+        ExecutorState {
             poll_ctx,
             token_map: BTreeMap::new(),
             next_token: 0,
