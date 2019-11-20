@@ -39,9 +39,11 @@ use sys_util::{PollContext, WatchingEvents};
 
 // Temporary holding areas for things added to the executor.
 // File descriptor wakers that are added during poll calls.
-thread_local!(static FDS: RefCell<Vec<(SavedFd, Waker, WatchingEvents)>> = RefCell::new(Vec::new()));
+thread_local!(static FDS: RefCell<Vec<(SavedFd, Waker, WatchingEvents)>> =
+              RefCell::new(Vec::new()));
 // Top level futures that are added during poll calls.
-thread_local!(static FUTURES: RefCell<Vec<(Pin<Box<dyn Future<Output = ()>>>, AtomicBool)>> = RefCell::new(Vec::new()));
+thread_local!(static FUTURES: RefCell<Vec<(Pin<Box<dyn Future<Output = ()>>>, AtomicBool)>> =
+              RefCell::new(Vec::new()));
 
 /// Tells the waking system to wake `waker` when `fd` becomes readable.
 pub fn add_read_waker(fd: &dyn AsRawFd, waker: Waker) {
