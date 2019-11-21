@@ -2,7 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-//! An Executor to be used to driver file descriptor based futures to completion.
+//! The executor runs all the futures added to it to completion. Futures register wakers
+//! associated with file descriptors. The wakers will be called when the FD becomes readable or
+//! writable depending on the situation.
+//!
+//! `FdExecutor` is meant to be used with the `futures-rs` crate that provides combinators and
+//! utility functions to combine futures.
 //!
 //! # Example of starting the framework and running a future:
 //!
@@ -15,16 +20,6 @@
 //! ex.add_future(Box::pin(my_async()));
 //! ex.run();
 //! ```
-//!
-//! When building futures to be run in an `FdExecutor` framework, use the following helper functions
-//! to perform common tasks:
-//!
-//! `add_read_waker` - Used to associate a provided FD becoming readable with the future being
-//! woken.
-//! `add_write_waker` - Used to associate a provided FD becoming writable with the future being
-//! woken.
-//! `add_future` - Used to add a new future to the top-level list of futures running.
-//!
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -37,7 +32,7 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 
 use sys_util::{PollContext, WatchingEvents};
 
-// Temporary holding areas for things added to the executor.
+// Temporary vectors of new additions to the executor.
 // File descriptor wakers that are added during poll calls.
 thread_local!(static NEW_FDS: RefCell<Vec<(SavedFd, Waker, WatchingEvents)>> =
               RefCell::new(Vec::new()));
@@ -243,103 +238,4 @@ static WAKER_VTABLE: RawWakerVTable =
 
 unsafe fn create_waker(data_ptr: *const ()) -> RawWaker {
     RawWaker::new(data_ptr, &WAKER_VTABLE)
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{add_read_waker, add_write_waker, FdExecutor};
-    use futures::io::{AsyncRead, AsyncWrite};
-    use futures::io::{AsyncReadExt, AsyncWriteExt};
-    use std::fs::File;
-    use std::io::{self, ErrorKind, Read, Write};
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    use sys_util::pipe_non_blocking;
-
-    struct AsyncRx(File);
-    struct AsyncTx(File);
-
-    fn async_pipes() -> (AsyncRx, AsyncTx) {
-        let (rx, tx) = pipe_non_blocking(true).unwrap();
-        (AsyncRx(rx), AsyncTx(tx))
-    }
-    impl AsyncRead for AsyncRx {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context,
-            buf: &mut [u8],
-        ) -> Poll<Result<usize, io::Error>> {
-            match self.0.read(buf) {
-                Ok(len) => Poll::Ready(Ok(len)),
-                Err(e) => {
-                    if e.kind() == ErrorKind::WouldBlock {
-                        add_read_waker(&self.0, cx.waker().clone());
-                        Poll::Pending
-                    } else {
-                        Poll::Ready(Err(e))
-                    }
-                }
-            }
-        }
-    }
-    impl AsyncWrite for AsyncTx {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context,
-            buf: &[u8],
-        ) -> Poll<Result<usize, io::Error>> {
-            match self.0.write(buf) {
-                Ok(len) => Poll::Ready(Ok(len)),
-                Err(e) => {
-                    if e.kind() == ErrorKind::WouldBlock {
-                        add_write_waker(&self.0, cx.waker().clone());
-                        Poll::Pending
-                    } else {
-                        Poll::Ready(Err(e))
-                    }
-                }
-            }
-        }
-
-        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), io::Error>> {
-            &self.0.flush().unwrap(); // This could block but it doesn't matter for the tests.
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), io::Error>> {
-            self.poll_flush(cx)
-        }
-    }
-
-    // A read and write closure are created and then added to the executor.
-    // They take turns blocking on the other sending a message.
-    #[test]
-    fn communicate_cross_closure() {
-        let (data_rx, data_tx) = async_pipes();
-        let (ack_rx, ack_tx) = async_pipes();
-
-        async fn handle_read(mut data_rx: AsyncRx, mut ack_tx: AsyncTx) {
-            let mut buf = [0x55u8; 48];
-            data_rx.read_exact(&mut buf).await.expect("Failed to read");
-            assert!(buf.iter().all(|&e| e == 0x00));
-            ack_tx.write_all(&[b'a']).await.unwrap();
-            data_rx.read_exact(&mut buf).await.expect("Failed to read");
-            assert!(buf.iter().all(|&e| e == 0xaa));
-        }
-
-        async fn handle_write(mut data_tx: AsyncTx, mut ack_rx: AsyncRx) {
-            let zeros = [0u8; 48];
-            data_tx.write_all(&zeros).await.unwrap();
-            let mut ack = [0u8];
-            assert!(ack_rx.read_exact(&mut ack).await.is_ok());
-            let aas = [0xaau8; 48];
-            data_tx.write_all(&aas).await.unwrap();
-        }
-
-        let mut ex = FdExecutor::new();
-        ex.add_future(Box::pin(handle_read(data_rx, ack_tx)));
-        ex.add_future(Box::pin(handle_write(data_tx, ack_rx)));
-
-        ex.run();
-    }
 }
