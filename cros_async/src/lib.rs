@@ -5,12 +5,13 @@
 //! An Executor and base futures based on operation that block on system file desrciptors.
 //!
 //! There are basic Futures provided for some of the interfaces provided byt the `sys_util` crate.
-//! These live under `async_utils`.
+//! These live under [`async_utils`](crate::async_utils).
 //!
 //! This crate is meant to be used with the `futures-rs` crate that provides combinators and
 //! utility functions to combine futures.
 //!
-//! The `FdExecutor` runs provided futures to completion, using FDs to wake the individual tasks.
+//! The [`FdExecutor`](crate::fd_executor::FdExecutor) runs provided futures to completion, using
+//! FDs to wake the individual tasks.
 //!
 //! # Implementing new FD-based futures.
 //!
@@ -134,10 +135,7 @@
 //! }
 //! ```
 
-mod aio;
-mod aio_abi_bindings;
-mod async_utils;
+pub mod async_utils;
 mod fd_executor;
 
-pub use async_utils::{AsyncEventFd, AsyncReceiver};
 pub use fd_executor::{add_future, add_read_waker, add_write_waker, FdExecutor};
