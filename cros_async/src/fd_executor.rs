@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-//! The executor runs all the futures added to it to completion. Futures register wakers
-//! associated with file descriptors. The wakers will be called when the FD becomes readable or
-//! writable depending on the situation.
+//! The executor runs all given futures to completion. Futures register wakers associated with file
+//! descriptors. The wakers will be called when the FD becomes readable or writable depending on
+//! the situation.
 //!
 //! `FdExecutor` is meant to be used with the `futures-rs` crate that provides combinators and
 //! utility functions to combine futures.
@@ -65,8 +65,7 @@ pub fn add_write_waker(fd: &dyn AsRawFd, waker: Waker) {
 }
 
 /// Adds a new top level future to the Executor.
-/// These futures must return `()`. The futures added here are intended to driver side-effects
-/// only. Use `add_future` for top-level futures.
+/// These futures must return `()`, indicating they are intended to create side-effects only.
 pub fn add_future(future: Pin<Box<dyn Future<Output = ()>>>) {
     NEW_FUTURES.with(|new_futures| {
         let mut new_futures = new_futures.borrow_mut();
@@ -102,22 +101,15 @@ impl FdExecutor {
         self.futures.push((future, AtomicBool::new(true)));
     }
 
-    /// Runs the given future until it completes. The future must return () as the `Output`.
-    pub fn run_one(future: Pin<Box<dyn Future<Output = ()>>>) {
-        let mut ex = Self::new();
-        ex.add_future(future);
-        ex.run()
+    /// Run the executor, this will return once all of the futures added to it have completed.
+    pub fn run(&mut self) {
+        self.run_all(false)
     }
 
     /// Run the executor until any future completes, returns once any of the futures added to it
     /// have completed.
     pub fn run_first(&mut self) {
         self.run_all(true)
-    }
-
-    /// Run the executor, this will return once all of the futures added to it have completed.
-    pub fn run(&mut self) {
-        self.run_all(false)
     }
 
     // Run the executor, If 'exit_any' is true, 'run_all' returns after any future completes. If
