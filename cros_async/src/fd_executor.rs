@@ -26,23 +26,21 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{self, Display};
 use std::future::Future;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::task::Waker;
 
-use sys_util::{PollContext, WatchingEvents};
+use sys_util::{Aio, AioCb, WatchingEvents};
 
 use crate::executor::{ExecutableFuture, Executor, FutureList};
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
-    /// Failed to copy the FD for the polling context.
-    DuplicatingFd(sys_util::Error),
     /// Failed accessing the thread local storage for wakers.
     InvalidContext,
     /// Creating a context to wait on FDs failed.
     CreatingContext(sys_util::Error),
-    /// Failed to submit the waker to the polling context.
+    /// Failed to submit the waker to the Aio context.
     SubmittingWaker(sys_util::Error),
 }
 pub type Result<T> = std::result::Result<T, Error>;
@@ -52,7 +50,6 @@ impl Display for Error {
         use self::Error::*;
 
         match self {
-            DuplicatingFd(e) => write!(f, "Failed to copy the FD for the polling context: {}", e),
             InvalidContext => write!(
                 f,
                 "Invalid context, was the Fd executor created successfully?"
@@ -110,15 +107,15 @@ pub fn add_future(future: Pin<Box<dyn Future<Output = ()>>>) {
 
 // Tracks active wakers and associates wakers with the futures that registered them.
 struct FdWakerState {
-    poll_ctx: PollContext<u64>,
-    token_map: BTreeMap<u64, (DupedFd, Waker)>,
-    next_token: u64, // Next token for adding to the context.
+    aio_ctx: Aio<u64>,
+    token_map: BTreeMap<u64, Waker>,
+    next_token: u64, // Next token for adding to the aio context.
 }
 
 impl FdWakerState {
-    fn new() -> Result<Self> {
+    fn new(max_ops: usize) -> Result<Self> {
         Ok(FdWakerState {
-            poll_ctx: PollContext::new().map_err(Error::CreatingContext)?,
+            aio_ctx: Aio::new(max_ops).map_err(Error::CreatingContext)?,
             token_map: BTreeMap::new(),
             next_token: 0,
         })
@@ -126,24 +123,22 @@ impl FdWakerState {
 
     // Adds an fd that, when signaled, will trigger the given waker.
     fn add_waker(&mut self, fd: RawFd, waker: Waker, events: WatchingEvents) -> Result<()> {
-        let duped_fd = DupedFd::new(fd)?;
         while self.token_map.contains_key(&self.next_token) {
             self.next_token += 1;
         }
-        self.poll_ctx
-            .add_fd_with_events(&duped_fd, events, self.next_token)
+        self.aio_ctx
+            .submit_cb(AioCb::new(fd, events, self.next_token))
             .map_err(Error::SubmittingWaker)?;
         let next_token = self.next_token;
-        self.token_map.insert(next_token, (duped_fd, waker));
+        self.token_map.insert(next_token, waker);
         Ok(())
     }
 
     // Waits until one of the FDs is readable and wakes the associated waker.
     fn wait_wake_event(&mut self) {
-        let events = self.poll_ctx.wait().unwrap(); //TODO unwrap.
-        for e in events.iter() {
-            if let Some((fd, waker)) = self.token_map.remove(&e.token()) {
-                self.poll_ctx.delete(&fd).unwrap(); // TODO unwrap.
+        let events = self.aio_ctx.events().unwrap();
+        for e in events {
+            if let Some(waker) = self.token_map.remove(&e.data) {
                 waker.wake_by_ref();
             }
         }
@@ -191,7 +186,7 @@ impl<T: FutureList> FdExecutor<T> {
     /// Create a new executor.
     pub fn new(futures: T) -> Result<FdExecutor<T>> {
         STATE.with(|waker_state| {
-            waker_state.replace(Some(FdWakerState::new()?));
+            waker_state.replace(Some(FdWakerState::new(256)?));
             Ok(())
         })?;
         Ok(FdExecutor { futures })
@@ -203,46 +198,5 @@ impl<T: FutureList> Drop for FdExecutor<T> {
         STATE.with(|waker_state| {
             waker_state.replace(None);
         });
-    }
-}
-
-// Track fd's after they are duped until they are added to the poll context.
-// Once the fd is in the poll context, it can be closed, which is handled by drop here.
-struct DupedFd(RawFd);
-
-impl DupedFd {
-    fn new(fd: RawFd) -> Result<DupedFd> {
-        Ok(DupedFd(unsafe {
-            // Safe because duplicating an FD doesn't affect memory safety, and the dup'd FD
-            // will only be added to the poll loop.
-            Self::dup_fd(fd)?
-        }))
-    }
-
-    // Used to dup the FDs passed to the executor so there is a guarantee they aren't closed while
-    // waiting in TLS to be added to the main polling context.
-    unsafe fn dup_fd(fd: RawFd) -> Result<RawFd> {
-        let ret = libc::dup(fd);
-        if ret < 0 {
-            Err(Error::DuplicatingFd(sys_util::Error::last()))
-        } else {
-            Ok(ret)
-        }
-    }
-}
-
-impl Drop for DupedFd {
-    fn drop(&mut self) {
-        // Safe to close the dup'd FD here as the kernel has another ref to it once it
-        // has been added to the context in `add_waker`.
-        unsafe {
-            libc::close(self.0);
-        }
-    }
-}
-
-impl AsRawFd for DupedFd {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
     }
 }
