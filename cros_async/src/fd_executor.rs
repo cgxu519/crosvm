@@ -42,6 +42,8 @@ pub enum Error {
     CreatingContext(sys_util::Error),
     /// Failed to submit the waker to the Aio context.
     SubmittingWaker(sys_util::Error),
+    /// Failed to submit the write to the Aio context.
+    SubmittingWrite(sys_util::Error),
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -56,6 +58,9 @@ impl Display for Error {
             ),
             CreatingContext(e) => write!(f, "An Error creating the fd waiting context: {}.", e),
             SubmittingWaker(e) => write!(f, "An Error adding to the Aio context: {}.", e),
+            SubmittingWrite(e) => {
+                write!(f, "An Error submitting a write to the Aio context: {}.", e)
+            }
         }
     }
 }
@@ -96,6 +101,18 @@ pub fn add_write_waker(fd: RawFd, waker: Waker) -> Result<()> {
     add_waker(fd, waker, WatchingEvents::empty().set_write())
 }
 
+/// Starts a write to the fd and registers waker to be woken once the write completes.
+pub fn start_write(fd: RawFd, buf: &[u8], waker: Waker) -> Result<()> {
+    STATE.with(|waker_state| {
+        let mut waker_state = waker_state.borrow_mut();
+        if let Some(waker_state) = waker_state.as_mut() {
+            waker_state.start_write(fd, buf, waker)
+        } else {
+            Err(Error::InvalidContext)
+        }
+    })
+}
+
 /// Adds a new top level future to the Executor.
 /// These futures must return `()`, indicating they are intended to create side-effects only.
 pub fn add_future(future: Pin<Box<dyn Future<Output = ()>>>) {
@@ -129,6 +146,19 @@ impl FdWakerState {
         self.aio_ctx
             .submit_cb(AioCb::new(fd, events, self.next_token))
             .map_err(Error::SubmittingWaker)?;
+        let next_token = self.next_token;
+        self.token_map.insert(next_token, waker);
+        Ok(())
+    }
+
+    // Starts writing buf to the given FD, wakes `waker` when the read completes.
+    fn start_write(&mut self, fd: RawFd, buf: &[u8], waker: Waker) -> Result<()> {
+        while self.token_map.contains_key(&self.next_token) {
+            self.next_token += 1;
+        }
+        self.aio_ctx
+            .submit_cb(AioCb::write(fd, buf, self.next_token))
+            .map_err(Error::SubmittingWrite)?;
         let next_token = self.next_token;
         self.token_map.insert(next_token, waker);
         Ok(())

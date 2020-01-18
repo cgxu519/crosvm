@@ -65,6 +65,13 @@ impl<T: PollToken> AioCb<T> {
             phantom: Default::default(),
         }
     }
+
+    pub fn write(fd: RawFd, buf: &[u8], token: T) -> AioCb<T> {
+        AioCb {
+            cb: write_iocb(token.as_raw_token(), fd, buf),
+            phantom: Default::default(),
+        }
+    }
 }
 
 // Creates a iocb for polling the given FD.
@@ -73,6 +80,17 @@ fn poll_iocb(token: u64, fd: RawFd, flag_events: u64) -> iocb {
     cb.aio_lio_opcode = IOCB_CMD_POLL as u16;
     cb.aio_data = token;
     cb.aio_buf = flag_events;
+    cb.aio_fildes = fd as u32;
+    cb
+}
+
+// Creates a iocb for writing to the given FD.
+fn write_iocb(token: u64, fd: RawFd, buf: &[u8]) -> iocb {
+    let mut cb: iocb = Default::default();
+    cb.aio_lio_opcode = IOCB_CMD_POLL as u16;
+    cb.aio_data = token;
+    cb.aio_buf = buf.as_ptr() as u64;
+    cb.aio_nbytes = buf.len() as u64;
     cb.aio_fildes = fd as u32;
     cb
 }
